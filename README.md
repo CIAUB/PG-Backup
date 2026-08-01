@@ -4,7 +4,7 @@
 
 ### Professional Backup, Restore & Migration Utility for PasarGuard & PG-Node
 
-![Version](https://img.shields.io/badge/Version-v3.0-blue)
+![Version](https://img.shields.io/badge/Version-v3.1-blue)
 ![Python](https://img.shields.io/badge/Python-3.8+-green)
 ![Platform](https://img.shields.io/badge/Platform-Linux-orange)
 ![Docker](https://img.shields.io/badge/Docker-Supported-2496ED)
