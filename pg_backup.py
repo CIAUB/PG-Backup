@@ -8,21 +8,22 @@
 import os, sys, subprocess, datetime, shutil
 import time, urllib.request, urllib.error, uuid, threading, itertools
 
-# ── ANSI Colors (readable: light on dark) ───────────────────
+# ── ANSI Colors ──────────────────────────────────────────────
+# Three red tones for hierarchy:
+#   R1  bright red  — active labels, prompts, highlights
+#   R2  mid red     — secondary info, borders, dividers
+#   R3  dark red    — dim text, decorations
+#   WH  white       — message body text (keeps readability)
+#   BLD bold
+#   DIM dim
 class C:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    # Foregrounds
-    WHITE   = "\033[97m"
-    CYAN    = "\033[96m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    BLUE    = "\033[94m"
-    MAGENTA = "\033[95m"
-    RED     = "\033[91m"
-    GRAY    = "\033[37m"
-    DKGRAY  = "\033[90m"
+    RESET = "\033[0m"
+    BOLD  = "\033[1m"
+    DIM   = "\033[2m"
+    R1    = "\033[38;2;255;80;80m"    # bright red  — titles, selections
+    R2    = "\033[38;2;200;50;50m"    # mid red     — labels, borders
+    R3    = "\033[38;2;120;20;20m"    # dark red    — dim / decorative
+    WH    = "\033[97m"                # white       — readable body text
 
 def clr():
     os.system("clear")
@@ -31,8 +32,8 @@ def tw():
     try: return os.get_terminal_size().columns
     except: return 80
 
-def hline(ch="─", color=C.DKGRAY):
-    return color + ch * tw() + C.RESET
+def hline(ch="─"):
+    return C.R3 + ch * tw() + C.RESET
 
 def center(s, raw_len=None):
     l = raw_len if raw_len is not None else len(s)
@@ -40,30 +41,30 @@ def center(s, raw_len=None):
     return " " * pad + s
 
 # ── Status helpers ───────────────────────────────────────────
-def ok(msg):   print(f"  {C.GREEN}✔{C.RESET}  {msg}")
-def err(msg):  print(f"  {C.RED}✘{C.RESET}  {msg}")
-def info(msg): print(f"  {C.CYAN}▸{C.RESET}  {msg}")
-def warn(msg): print(f"  {C.YELLOW}!{C.RESET}  {msg}")
+def ok(msg):   print(f"  {C.R1}+{C.RESET}  {C.WH}{msg}{C.RESET}")
+def err(msg):  print(f"  {C.R1}x{C.RESET}  {C.WH}{msg}{C.RESET}")
+def info(msg): print(f"  {C.R2}>{C.RESET}  {C.WH}{msg}{C.RESET}")
+def warn(msg): print(f"  {C.R1}!{C.RESET}  {C.WH}{msg}{C.RESET}")
 
-def print_success(msg): print(f"{C.GREEN}✅ [SUCCESS]{C.RESET} {msg}")
-def print_error(msg):   print(f"{C.RED}❌ [ERROR]{C.RESET}   {msg}")
-def print_info(msg):    print(f"{C.CYAN}ℹ️  [INFO]{C.RESET}   {msg}")
-def print_warning(msg): print(f"{C.YELLOW}⚠️  [WARNING]{C.RESET} {msg}")
+def print_success(msg): print(f"  {C.R1}[OK]{C.RESET}   {C.WH}{msg}{C.RESET}")
+def print_error(msg):   print(f"  {C.R1}[ERR]{C.RESET}  {C.WH}{msg}{C.RESET}")
+def print_info(msg):    print(f"  {C.R2}[..]{C.RESET}   {C.WH}{msg}{C.RESET}")
+def print_warning(msg): print(f"  {C.R1}[!!]{C.RESET}   {C.WH}{msg}{C.RESET}")
 
 def pause_and_return():
-    input(f"\n{C.YELLOW}Press [ENTER] to return to the main menu...{C.RESET}")
+    input(f"\n  {C.R2}Press ENTER to return to the main menu...{C.RESET}")
 
 # ── Spinner ──────────────────────────────────────────────────
 class Spinner:
     def __init__(self, message="Processing..."):
-        self.cycle = itertools.cycle(['-', '\\', '|', '/'])
-        self.stop  = threading.Event()
-        self.msg   = message
+        self.cycle  = itertools.cycle(['-', '\\', '|', '/'])
+        self.stop   = threading.Event()
+        self.msg    = message
         self.thread = threading.Thread(target=self._spin)
 
     def _spin(self):
         while not self.stop.is_set():
-            sys.stdout.write(f"\r{C.YELLOW}⏳ {next(self.cycle)} {self.msg}{C.RESET}")
+            sys.stdout.write(f"\r  {C.R2}{next(self.cycle)}{C.RESET}  {C.WH}{self.msg}{C.RESET}")
             sys.stdout.flush()
             time.sleep(0.1)
         sys.stdout.write('\r' + ' ' * (len(self.msg) + 15) + '\r')
@@ -81,7 +82,7 @@ class Spinner:
 try:
     import paramiko
 except ImportError:
-    print(f"{C.YELLOW}⏳ Required libraries not found. Installing...{C.RESET}")
+    print(f"  {C.R2}[..]{C.RESET}  {C.WH}Required libraries not found. Installing...{C.RESET}")
     with Spinner("Installing Paramiko... Please wait"):
         try:
             subprocess.check_call(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -91,7 +92,7 @@ except ImportError:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "--quiet"],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     import paramiko
-    print(f"{C.GREEN}✅ Libraries installed successfully!{C.RESET}\n")
+    print(f"  {C.R1}[OK]{C.RESET}  {C.WH}Libraries installed successfully!{C.RESET}\n")
 
 # ── Paths ────────────────────────────────────────────────────
 PASARGUARD_DIR      = "/opt/pasarguard"
@@ -99,12 +100,12 @@ PG_NODE_DIR         = "/opt/pg-node"
 PASARGUARD_DATA_DIR = "/var/lib/pasarguard"
 PG_NODE_DATA_DIR    = "/var/lib/pg-node"
 
-COMPOSE_DOWN_TIMEOUT     = 30
-POSTGRES_READY_MAX_WAIT  = 120
-POSTGRES_READY_INTERVAL  = 2
-COMPOSE_UP_MAX_WAIT      = 120
-COMPOSE_UP_INTERVAL      = 3
-COMPOSE_STOP_RETRIES     = 3
+COMPOSE_DOWN_TIMEOUT    = 30
+POSTGRES_READY_MAX_WAIT = 120
+POSTGRES_READY_INTERVAL = 2
+COMPOSE_UP_MAX_WAIT     = 120
+COMPOSE_UP_INTERVAL     = 3
+COMPOSE_STOP_RETRIES    = 3
 
 # ── Logo / Header ────────────────────────────────────────────
 LOGO = [
@@ -121,15 +122,14 @@ def print_header(title=""):
     clr()
     print()
     for line in LOGO:
-        print(center(C.CYAN + C.BOLD + line + C.RESET, LOGO_W))
-
-    sub = C.DKGRAY + C.DIM + "B A C K U P   U T I L I T Y   ·   v 3 . 0   ·   E O A M I R" + C.RESET
-    print(center(sub, 69))
+        print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
+    sub = C.R3 + C.DIM + "B A C K U P   U T I L I T Y   v 3 . 0   -   E O A M I R" + C.RESET
+    print(center(sub, 57))
     print()
-    print(hline("─", C.DKGRAY))
+    print(hline())
     if title:
         print()
-        print(center(C.WHITE + C.BOLD + title + C.RESET, len(title)))
+        print(center(C.R1 + C.BOLD + title + C.RESET, len(title)))
     print()
 
 # ── Shell helpers ─────────────────────────────────────────────
@@ -161,12 +161,12 @@ def ssh_shell(ssh, command):
     return exit_status, stdout.read().decode().strip(), stderr.read().decode().strip()
 
 def execute_ssh_command(ssh, command, description, required=True):
-    print(f"  {C.CYAN}🌐{C.RESET}  {description}...")
-    exit_status, out, err = ssh_shell(ssh, command)
+    print(f"  {C.R2}[SSH]{C.RESET}  {C.WH}{description}...{C.RESET}")
+    exit_status, out, er = ssh_shell(ssh, command)
     if exit_status == 0:
         ok("Done.")
     else:
-        err_msg = err or out
+        err_msg = er or out
         print_error("Command failed!")
         if err_msg:
             print_error(f"Details: {err_msg}")
@@ -342,7 +342,7 @@ def clean_dirs_ssh(ssh, include_node=True):
 
 # ── Telegram ─────────────────────────────────────────────────
 def send_telegram_file(token, chat_id, file_path, caption=""):
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    url      = f"https://api.telegram.org/bot{token}/sendDocument"
     boundary = f"----WKF{uuid.uuid4().hex}"
     if not os.path.exists(file_path):
         return False, "File not found"
@@ -351,7 +351,7 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
             fc = f.read()
     except Exception as e:
         return False, str(e)
-    fn = os.path.basename(file_path)
+    fn    = os.path.basename(file_path)
     parts = []
     def field(n, v):
         parts.append(f"--{boundary}".encode())
@@ -369,7 +369,7 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     parts.append(f"--{boundary}--".encode())
     parts.append(b"")
     body = b"\r\n".join(parts)
-    req = urllib.request.Request(url, data=body)
+    req  = urllib.request.Request(url, data=body)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     req.add_header("Content-Length", str(len(body)))
     try:
@@ -380,36 +380,38 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     except Exception as e:
         return False, str(e)
 
-# ── Backup creation ──────────────────────────────────────────
+# ── Backup scope selector ─────────────────────────────────────
 def ask_backup_scope():
-    """Ask user whether to back up only PasarGuard or both."""
     print()
-    print(f"  {C.CYAN}What do you want to back up?{C.RESET}")
+    print(f"  {C.R2}What do you want to back up?{C.RESET}")
     print()
-    print(f"  {C.WHITE}1{C.RESET}{C.DKGRAY} ─{C.RESET}  {C.GREEN}PasarGuard only{C.RESET}  {C.DKGRAY}(/opt/pasarguard + DB + /var/lib/pasarguard){C.RESET}")
-    print(f"  {C.WHITE}2{C.RESET}{C.DKGRAY} ─{C.RESET}  {C.YELLOW}PasarGuard + PG-Node{C.RESET}  {C.DKGRAY}(everything above + /opt/pg-node + /var/lib/pg-node){C.RESET}")
+    print(f"  {C.R1}1{C.RESET}  {C.R3}-{C.RESET}  {C.WH}PasarGuard only{C.RESET}  "
+          f"{C.R3}(/opt/pasarguard + DB + /var/lib/pasarguard){C.RESET}")
+    print(f"  {C.R1}2{C.RESET}  {C.R3}-{C.RESET}  {C.WH}PasarGuard + PG-Node{C.RESET}  "
+          f"{C.R3}(everything above + /opt/pg-node + /var/lib/pg-node){C.RESET}")
     print()
     while True:
-        choice = input(f"  {C.CYAN}▸  Enter 1 or 2: {C.RESET}").strip()
+        choice = input(f"  {C.R2}> Enter 1 or 2: {C.RESET}").strip()
         if choice in ("1", "2"):
             return choice == "2"
         print_error("Invalid choice. Enter 1 or 2.")
 
+# ── Backup creation ───────────────────────────────────────────
 def create_backup(include_node=True):
     scope_label = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
-    print_info(f"Starting backup — scope: {C.BOLD}{scope_label}{C.RESET}")
+    print_info(f"Starting backup  scope: {C.BOLD}{scope_label}{C.RESET}")
 
-    ts         = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    scope_tag  = "full" if include_node else "pg"
+    ts          = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    scope_tag   = "full" if include_node else "pg"
     backup_name = f"backup_{scope_tag}_{ts}"
     tmp_dir     = f"/tmp/{backup_name}"
     final_base  = os.path.join(os.getcwd(), backup_name)
     zip_path    = f"{final_base}.zip"
 
-    pg_dump_dir       = os.path.join(tmp_dir, "pg_dump")
-    pg_data_dest      = os.path.join(tmp_dir, "pasarguard_data")
-    node_opt_dest     = os.path.join(tmp_dir, "pg_node_opt")
-    node_data_dest    = os.path.join(tmp_dir, "pg_node_data")
+    pg_dump_dir    = os.path.join(tmp_dir, "pg_dump")
+    pg_data_dest   = os.path.join(tmp_dir, "pasarguard_data")
+    node_opt_dest  = os.path.join(tmp_dir, "pg_node_opt")
+    node_data_dest = os.path.join(tmp_dir, "pg_node_data")
 
     try:
         os.makedirs(pg_dump_dir, exist_ok=True)
@@ -444,7 +446,6 @@ def create_backup(include_node=True):
                 shutil.copytree(PG_NODE_DIR, node_opt_dest)
             else:
                 print_warning(f"{PG_NODE_DIR} not found — skipped")
-
             if os.path.exists(PG_NODE_DATA_DIR):
                 print_info("Copying PG-Node data (/var/lib/pg-node)...")
                 shutil.copytree(PG_NODE_DATA_DIR, node_data_dest)
@@ -462,7 +463,7 @@ def create_backup(include_node=True):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
-# ── Workflow 1: Auto transfer to new server ──────────────────
+# ── Workflow 1: Transfer to new server ───────────────────────
 def workflow_transfer():
     print_header("Auto Backup & Transfer to New Server")
 
@@ -473,24 +474,25 @@ def workflow_transfer():
         return
 
     print()
-    send_tg = input(f"{C.CYAN}🤖 Send backup to Telegram first? (y/n): {C.RESET}").strip().lower()
+    send_tg = input(f"  {C.R2}> Send backup to Telegram first? (y/n): {C.RESET}").strip().lower()
     if send_tg == "y":
-        bot_token = input(f"  {C.CYAN}Bot Token: {C.RESET}").strip()
-        admin_id  = input(f"  {C.CYAN}Admin Chat ID: {C.RESET}").strip()
+        bot_token = input(f"  {C.R2}> Bot Token: {C.RESET}").strip()
+        admin_id  = input(f"  {C.R2}> Admin Chat ID: {C.RESET}").strip()
         print_info("Uploading to Telegram...")
-        cap = (f"📦 PasarGuard{'+ PG-Node' if include_node else ''} Manual Transfer Backup\n"
-               f"🕒 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        cap = (f"PasarGuard {'+ PG-Node ' if include_node else ''}Manual Transfer Backup\n"
+               f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         success, details = send_telegram_file(bot_token, admin_id, zip_path, cap)
         if success: print_success("Sent to Telegram!")
         else:       print_error(f"Telegram upload failed: {details}")
 
-    print(f"\n{C.BOLD}--- New Server Information ---{C.RESET}")
-    new_ip   = input(f"  {C.CYAN}New Server IP: {C.RESET}").strip()
-    confirm  = input(f"  {C.YELLOW}User MUST be root. Confirm? (y/n): {C.RESET}").strip().lower()
+    print()
+    print(f"  {C.R1}{C.BOLD}--- New Server Information ---{C.RESET}")
+    new_ip   = input(f"  {C.R2}> New Server IP: {C.RESET}").strip()
+    confirm  = input(f"  {C.R1}> User MUST be root. Confirm? (y/n): {C.RESET}").strip().lower()
     if confirm != "y":
         print_error("Root access required. Aborting.")
         return
-    new_pass = input(f"  {C.CYAN}Root Password: {C.RESET}").strip()
+    new_pass = input(f"  {C.R2}> Root Password: {C.RESET}").strip()
 
     print_info(f"Connecting to {new_ip}...")
     ssh = paramiko.SSHClient()
@@ -500,8 +502,9 @@ def workflow_transfer():
         print_success("Connected!")
         print()
 
-        execute_ssh_command(ssh, "apt-get update >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1",
-                            "Installing unzip")
+        execute_ssh_command(ssh,
+            "apt-get update >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1",
+            "Installing unzip")
 
         if include_node:
             if not stop_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
@@ -515,17 +518,16 @@ def workflow_transfer():
             print_error("Directory cleanup failed. Aborting.")
             return
 
-        print(f"  {C.CYAN}🌐{C.RESET}  Uploading backup file (depends on internet speed)...")
-        sftp = ssh.open_sftp()
-        zip_fn         = os.path.basename(zip_path)
-        remote_zip     = f"/opt/pasarguard/{zip_fn}"
+        print_info("Uploading backup file (depends on internet speed)...")
+        sftp       = ssh.open_sftp()
+        zip_fn     = os.path.basename(zip_path)
+        remote_zip = f"/opt/pasarguard/{zip_fn}"
         sftp.put(zip_path, remote_zip)
         sftp.close()
         print_success("Upload completed.")
 
         execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {zip_fn}",
                             "Extracting files")
-
         execute_ssh_command(ssh,
             "cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true "
             "&& rm -rf /opt/pasarguard/pasarguard_data",
@@ -550,29 +552,27 @@ def workflow_transfer():
             'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres '
             '-c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"',
             "Dropping old database")
-
         execute_ssh_command(ssh,
             'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres '
             '-c "CREATE DATABASE pasarguard;"',
             "Creating fresh database")
-
         execute_ssh_command(ssh,
             "cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard",
             "Restoring globals.sql")
-
         execute_ssh_command(ssh,
-            "cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard",
+            "cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql "
+            "-U pasarguard -d pasarguard",
             "Restoring db-001.sql (may take a while for large DBs)")
 
         if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
             print_error("Pasarguard did not start. Aborting.")
             return
-
         if include_node and not start_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
             print_error("PG-Node did not start.")
 
-        print_header("Transfer & Restore Completed Successfully! 🎉")
-        print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running on the new server.")
+        print_header("Transfer & Restore Completed Successfully!")
+        print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") +
+                      " running on the new server.")
 
     except paramiko.AuthenticationException:
         print_error("Incorrect server password!")
@@ -592,36 +592,36 @@ def workflow_backup_bot():
 
     include_node = ask_backup_scope()
 
-    bot_token = input(f"  {C.CYAN}Bot Token: {C.RESET}").strip()
+    bot_token = input(f"  {C.R2}> Bot Token: {C.RESET}").strip()
     while not bot_token:
-        bot_token = input(f"  {C.RED}Cannot be empty!{C.RESET} {C.CYAN}Bot Token: {C.RESET}").strip()
+        bot_token = input(f"  {C.R1}Cannot be empty!{C.RESET}  {C.R2}> Bot Token: {C.RESET}").strip()
 
-    admin_id = input(f"  {C.CYAN}Admin Chat ID (numeric): {C.RESET}").strip()
+    admin_id = input(f"  {C.R2}> Admin Chat ID (numeric): {C.RESET}").strip()
     while not admin_id or not admin_id.lstrip("-").isdigit():
-        admin_id = input(f"  {C.RED}Invalid!{C.RESET} {C.CYAN}Admin Chat ID: {C.RESET}").strip()
+        admin_id = input(f"  {C.R1}Invalid!{C.RESET}  {C.R2}> Admin Chat ID: {C.RESET}").strip()
 
     try:
-        interval_h = float(input(f"  {C.CYAN}Interval in hours (e.g. 1, 0.5): {C.RESET}").strip())
+        interval_h = float(input(f"  {C.R2}> Interval in hours (e.g. 1, 0.5): {C.RESET}").strip())
     except ValueError:
         print_warning("Invalid number. Defaulting to 1.0 hour.")
         interval_h = 1.0
 
-    interval_s = int(interval_h * 3600)
+    interval_s  = int(interval_h * 3600)
     scope_label = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
-    print_info(f"Scheduler started — scope: {C.BOLD}{scope_label}{C.RESET}, every {interval_h}h.")
+    print_info(f"Scheduler started  scope: {C.BOLD}{scope_label}{C.RESET}  every {interval_h}h")
     print_warning("Press Ctrl+C to stop.")
     print(hline())
 
     try:
         while True:
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n{C.BOLD}⏳ Starting scheduled backup at {now_str}...{C.RESET}")
+            print(f"\n  {C.R2}[..]{C.RESET}  {C.WH}Starting scheduled backup at {now_str}...{C.RESET}")
 
             zip_path = create_backup(include_node)
             if zip_path and os.path.exists(zip_path):
                 print_info("Uploading to Telegram...")
-                cap = (f"🤖 PasarGuard{'+ PG-Node' if include_node else ''} Auto Backup\n"
-                       f"🕒 {now_str}\n⏱ Interval: {interval_h}h")
+                cap = (f"PasarGuard {'+ PG-Node ' if include_node else ''}Auto Backup\n"
+                       f"Date: {now_str}\nInterval: {interval_h}h")
                 success, details = send_telegram_file(bot_token, admin_id, zip_path, cap)
                 if success: print_success("Backup sent to Telegram!")
                 else:       print_error(f"Send failed: {details}")
@@ -637,7 +637,7 @@ def workflow_backup_bot():
             time.sleep(interval_s)
 
     except KeyboardInterrupt:
-        print(f"\n{C.YELLOW}🚪 Scheduler stopped.{C.RESET}")
+        print(f"\n  {C.R2}Scheduler stopped.{C.RESET}")
 
 # ── Workflow 3: Manual local backup ──────────────────────────
 def workflow_manual_backup():
@@ -658,13 +658,15 @@ def workflow_manual_restore():
     scope_label  = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
     print_info(f"Scope: {C.BOLD}{scope_label}{C.RESET}")
 
-    zip_name = input(f"  {C.CYAN}Backup ZIP filename (e.g. backup_full_20260101.zip): {C.RESET}").strip()
+    zip_name = input(
+        f"  {C.R2}> Backup ZIP filename (e.g. backup_full_20260101.zip): {C.RESET}"
+    ).strip()
     if not os.path.exists(zip_name):
         print_error(f"File '{zip_name}' not found in current directory.")
         return
 
     confirm = input(
-        f"  {C.RED}⚠️  This will overwrite current config and database. Continue? (y/n): {C.RESET}"
+        f"  {C.R1}> WARNING: This will overwrite current config and database. Continue? (y/n): {C.RESET}"
     ).strip().lower()
     if confirm != "y":
         print_warning("Aborted.")
@@ -702,30 +704,32 @@ def workflow_manual_restore():
             raise Exception("timescaledb did not start")
 
         print_info("Dropping old database...")
-        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres '
+        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql '
+                           '-U pasarguard -d postgres '
                            '-c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"'):
             raise Exception("Failed to drop old database")
 
         print_info("Creating fresh database...")
-        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres '
-                           '-c "CREATE DATABASE pasarguard;"'):
+        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql '
+                           '-U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"'):
             raise Exception("Failed to create database")
 
         print_info("Restoring globals.sql...")
-        if not run_command("cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard"):
+        if not run_command("cd /opt/pasarguard && cat pg_dump/globals.sql | "
+                           "docker compose exec -T timescaledb psql -U pasarguard"):
             raise Exception("Failed to restore globals.sql")
 
         print_info("Restoring db-001.sql (may take a while)...")
-        if not run_command("cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql -U pasarguard -d pasarguard"):
+        if not run_command("cd /opt/pasarguard && cat pg_dump/db-001.sql | "
+                           "docker compose exec -T timescaledb psql -U pasarguard -d pasarguard"):
             raise Exception("Failed to restore db-001.sql")
 
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
             raise Exception("Pasarguard did not start")
-
         if include_node and not start_compose_local(PG_NODE_DIR, "PG-Node"):
             print_error("PG-Node did not start.")
 
-        print_header("Local Restore Completed Successfully! 🎉")
+        print_header("Local Restore Completed Successfully!")
         print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running.")
 
     except Exception as e:
@@ -734,25 +738,27 @@ def workflow_manual_restore():
 
 # ── Main menu ─────────────────────────────────────────────────
 MENU = [
-    ("1", "🚀", "Auto Backup & Transfer to New Server"),
-    ("2", "🤖", "Auto Backup to Telegram Bot (Scheduled)"),
-    ("3", "💾", "Manual Backup (Save locally)"),
-    ("4", "🔄", "Manual Restore (From local zip)"),
-    ("5", "🚪", "Exit"),
+    ("1", "Auto Backup & Transfer to New Server"),
+    ("2", "Auto Backup to Telegram Bot (Scheduled)"),
+    ("3", "Manual Backup (Save locally)"),
+    ("4", "Manual Restore (From local zip)"),
+    ("5", "Exit"),
 ]
 
 def main():
     while True:
         print_header()
 
-        print(f"  {C.DKGRAY}{'─'*50}{C.RESET}")
-        for num, icon, label in MENU:
-            num_col = C.RED if num == "5" else C.WHITE
-            print(f"  {num_col}{num}{C.RESET}{C.DKGRAY} ─{C.RESET}  {icon}  {C.WHITE}{label}{C.RESET}")
-        print(f"  {C.DKGRAY}{'─'*50}{C.RESET}")
+        print(f"  {C.R3}{'─' * 50}{C.RESET}")
+        for num, label in MENU:
+            if num == "5":
+                print(f"  {C.R3}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.R2}{label}{C.RESET}")
+            else:
+                print(f"  {C.R1}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}{label}{C.RESET}")
+        print(f"  {C.R3}{'─' * 50}{C.RESET}")
         print()
 
-        choice = input(f"  {C.CYAN}▸  Select option (1-5): {C.RESET}").strip()
+        choice = input(f"  {C.R2}> Select option (1-5): {C.RESET}").strip()
         print()
 
         if choice == "1":
@@ -768,7 +774,7 @@ def main():
             workflow_manual_restore()
             pause_and_return()
         elif choice == "5":
-            print(f"  {C.YELLOW}🚪 Goodbye!{C.RESET}\n")
+            print(f"  {C.R2}Goodbye.{C.RESET}\n")
             sys.exit(0)
         else:
             print_error("Invalid option. Please enter 1-5.")
