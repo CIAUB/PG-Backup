@@ -67,7 +67,7 @@ sudo bash -c "$(curl -sL https://raw.githack.com/EOAMIR/PG-Backup/main/install.s
 پس از نصب، برای باز کردن منوی ابزار کافی است دستور زیر را اجرا کنید:
 
 ```bash
-pg-backup
+PG-Backup
 ```
 
 ---
