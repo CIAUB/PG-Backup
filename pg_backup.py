@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v3.0
+#   Pasarguard Backup Utility  v3.1
 #   Dev by: EOAMIR
 #   GitHub: https://github.com/EOAMIR
 # ============================================================
 
 import os, sys, subprocess, datetime, shutil
 import time, urllib.request, urllib.error, uuid, threading, itertools
+import argparse, shlex
 
 # ── ANSI Colors ──────────────────────────────────────────────
 # Three red tones for hierarchy:
@@ -79,20 +80,23 @@ class Spinner:
         self.thread.join()
 
 # ── Auto-install paramiko ────────────────────────────────────
-try:
-    import paramiko
-except ImportError:
-    print(f"  {C.R2}[..]{C.RESET}  {C.WH}Required libraries not found. Installing...{C.RESET}")
-    with Spinner("Installing Paramiko... Please wait"):
-        try:
-            subprocess.check_call(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.check_call(["apt-get", "install", "-y", "python3-paramiko", "python3-pip", "unzip"],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "--quiet"],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    import paramiko
-    print(f"  {C.R1}[OK]{C.RESET}  {C.WH}Libraries installed successfully!{C.RESET}\n")
+# Skip this when running as the headless daemon child (spawned by screen /
+# tmux / systemd) so the persistence layer doesn't repeat the apt/pip dance.
+if "--daemon-backup" not in sys.argv:
+    try:
+        import paramiko
+    except ImportError:
+        print(f"  {C.R2}[..]{C.RESET}  {C.WH}Required libraries not found. Installing...{C.RESET}")
+        with Spinner("Installing Paramiko... Please wait"):
+            try:
+                subprocess.check_call(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.check_call(["apt-get", "install", "-y", "python3-paramiko", "python3-pip", "unzip"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "paramiko", "--quiet"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import paramiko
+        print(f"  {C.R1}[OK]{C.RESET}  {C.WH}Libraries installed successfully!{C.RESET}\n")
 
 # ── Paths ────────────────────────────────────────────────────
 PASARGUARD_DIR      = "/opt/pasarguard"
@@ -106,6 +110,11 @@ POSTGRES_READY_INTERVAL = 2
 COMPOSE_UP_MAX_WAIT     = 120
 COMPOSE_UP_INTERVAL     = 3
 COMPOSE_STOP_RETRIES    = 3
+
+SCREEN_SESSION_NAME    = "pasarguard_backup"
+TMUX_SESSION_NAME      = "pasarguard_backup"
+SYSTEMD_SERVICE_NAME   = "pasarguard-backup"
+SYSTEMD_SERVICE_PATH   = f"/etc/systemd/system/{SYSTEMD_SERVICE_NAME}.service"
 
 # ── Logo / Header ────────────────────────────────────────────
 LOGO = [
@@ -123,7 +132,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R3 + C.DIM + "B A C K U P   U T I L I T Y   v 3 . 0   -   E O A M I R" + C.RESET
+    sub = C.R3 + C.DIM + "B A C K U P   U T I L I T Y   v 3 . 1   -   E O A M I R" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
@@ -171,6 +180,130 @@ def execute_ssh_command(ssh, command, description, required=True):
         if err_msg:
             print_error(f"Details: {err_msg}")
     return exit_status == 0 if required else True
+
+# ── Persistence helpers (screen / tmux / systemd) ─────────────
+def ensure_tool_installed(binary, pkg=None):
+    """Make sure a local CLI tool (screen/tmux) is available, installing it via apt if missing."""
+    pkg = pkg or binary
+    if shutil.which(binary):
+        return True
+    print_info(f"'{binary}' not found. Installing '{pkg}'...")
+    with Spinner(f"Installing {pkg}..."):
+        run_command("apt-get update", quiet=True)
+        run_command(f"apt-get install -y {pkg}", quiet=True)
+    if shutil.which(binary):
+        print_success(f"'{pkg}' installed.")
+        return True
+    print_error(f"Failed to install '{pkg}'. Please install it manually and try again.")
+    return False
+
+def build_daemon_command(bot_token, admin_id, interval_h, include_node):
+    """Builds the exact CLI invocation used to re-run this same script headlessly."""
+    script_path = os.path.abspath(__file__)
+    parts = [
+        sys.executable, script_path, "--daemon-backup",
+        "--token", bot_token,
+        "--chat", admin_id,
+        "--interval", str(interval_h),
+    ]
+    if include_node:
+        parts.append("--node")
+    return " ".join(shlex.quote(p) for p in parts)
+
+def ask_persistence_mode():
+    print()
+    print(f"  {C.R2}How should the scheduler keep running after this SSH session closes?{C.RESET}")
+    print()
+    print(f"  {C.R1}1{C.RESET}  {C.R3}-{C.RESET}  {C.WH}None{C.RESET}      {C.R3}(runs in this terminal only; stops when SSH disconnects){C.RESET}")
+    print(f"  {C.R1}2{C.RESET}  {C.R3}-{C.RESET}  {C.WH}screen{C.RESET}    {C.R3}(detached 'screen' session on the server){C.RESET}")
+    print(f"  {C.R1}3{C.RESET}  {C.R3}-{C.RESET}  {C.WH}tmux{C.RESET}      {C.R3}(detached 'tmux' session on the server){C.RESET}")
+    print(f"  {C.R1}4{C.RESET}  {C.R3}-{C.RESET}  {C.WH}systemd{C.RESET}   {C.R3}(background service; survives reboot too){C.RESET}")
+    print()
+    while True:
+        choice = input(f"  {C.R2}> Enter 1, 2, 3 or 4: {C.RESET}").strip()
+        if choice in ("1", "2", "3", "4"):
+            return choice
+        print_error("Invalid choice. Enter 1, 2, 3 or 4.")
+
+def launch_via_screen(daemon_cmd):
+    if not ensure_tool_installed("screen"):
+        return False
+    exists, _, _ = local_shell(f"screen -list | grep -q '\\.{SCREEN_SESSION_NAME}\\b'")
+    if exists:
+        print_warning(f"A screen session named '{SCREEN_SESSION_NAME}' already exists.")
+        kill_it = input(f"  {C.R2}> Kill it and start a fresh one? (y/n): {C.RESET}").strip().lower()
+        if kill_it != "y":
+            print_warning("Aborted — leaving the existing session untouched.")
+            return False
+        run_command(f"screen -S {SCREEN_SESSION_NAME} -X quit", quiet=True)
+    if not run_command(f"screen -dmS {SCREEN_SESSION_NAME} {daemon_cmd}"):
+        print_error("Failed to start the screen session.")
+        return False
+    print_success(f"Scheduler started in detached screen session '{SCREEN_SESSION_NAME}'.")
+    print_info(f"Reattach anytime with:  screen -r {SCREEN_SESSION_NAME}")
+    print_info(f"Stop it with:           screen -S {SCREEN_SESSION_NAME} -X quit")
+    return True
+
+def launch_via_tmux(daemon_cmd):
+    if not ensure_tool_installed("tmux"):
+        return False
+    exists, _, _ = local_shell(f"tmux has-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+    if exists:
+        print_warning(f"A tmux session named '{TMUX_SESSION_NAME}' already exists.")
+        kill_it = input(f"  {C.R2}> Kill it and start a fresh one? (y/n): {C.RESET}").strip().lower()
+        if kill_it != "y":
+            print_warning("Aborted — leaving the existing session untouched.")
+            return False
+        run_command(f"tmux kill-session -t {TMUX_SESSION_NAME}", quiet=True)
+    if not run_command(f"tmux new-session -d -s {TMUX_SESSION_NAME} {daemon_cmd}"):
+        print_error("Failed to start the tmux session.")
+        return False
+    print_success(f"Scheduler started in detached tmux session '{TMUX_SESSION_NAME}'.")
+    print_info(f"Reattach anytime with:  tmux attach -t {TMUX_SESSION_NAME}")
+    print_info(f"Stop it with:           tmux kill-session -t {TMUX_SESSION_NAME}")
+    return True
+
+def launch_via_systemd(daemon_cmd):
+    if shutil.which("systemctl") is None:
+        print_error("systemctl not found — this server does not appear to use systemd.")
+        return False
+    unit = (
+        "[Unit]\n"
+        "Description=PasarGuard Scheduled Backup\n"
+        "After=network-online.target docker.service\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={daemon_cmd}\n"
+        "Restart=always\n"
+        "RestartSec=10\n"
+        "User=root\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+    try:
+        with open(SYSTEMD_SERVICE_PATH, "w") as f:
+            f.write(unit)
+    except Exception as e:
+        print_error(f"Could not write unit file: {e}")
+        return False
+
+    print_info("Reloading systemd and enabling the service...")
+    steps = [
+        ("systemctl daemon-reload", "daemon-reload"),
+        (f"systemctl enable {SYSTEMD_SERVICE_NAME}", "enable"),
+        (f"systemctl restart {SYSTEMD_SERVICE_NAME}", "start"),
+    ]
+    for cmd, label in steps:
+        if not run_command(cmd):
+            print_error(f"systemctl {label} failed.")
+            return False
+
+    print_success(f"Scheduler installed as systemd service '{SYSTEMD_SERVICE_NAME}'.")
+    print_info(f"Check status with:  systemctl status {SYSTEMD_SERVICE_NAME}")
+    print_info(f"Live logs with:     journalctl -u {SYSTEMD_SERVICE_NAME} -f")
+    print_info(f"Stop it with:       systemctl stop {SYSTEMD_SERVICE_NAME}")
+    return True
 
 # ── Docker compose helpers ────────────────────────────────────
 def _running_ids_local(d):
@@ -587,25 +720,10 @@ def workflow_transfer():
             pass
 
 # ── Workflow 2: Scheduled Telegram backup ────────────────────
-def workflow_backup_bot():
-    print_header("Auto Backup to Telegram Bot (Scheduled)")
-
-    include_node = ask_backup_scope()
-
-    bot_token = input(f"  {C.R2}> Bot Token: {C.RESET}").strip()
-    while not bot_token:
-        bot_token = input(f"  {C.R1}Cannot be empty!{C.RESET}  {C.R2}> Bot Token: {C.RESET}").strip()
-
-    admin_id = input(f"  {C.R2}> Admin Chat ID (numeric): {C.RESET}").strip()
-    while not admin_id or not admin_id.lstrip("-").isdigit():
-        admin_id = input(f"  {C.R1}Invalid!{C.RESET}  {C.R2}> Admin Chat ID: {C.RESET}").strip()
-
-    try:
-        interval_h = float(input(f"  {C.R2}> Interval in hours (e.g. 1, 0.5): {C.RESET}").strip())
-    except ValueError:
-        print_warning("Invalid number. Defaulting to 1.0 hour.")
-        interval_h = 1.0
-
+def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node):
+    """The actual recurring backup+upload loop. Shared by the interactive
+    'None' persistence mode and the headless --daemon-backup entrypoint
+    (used by screen / tmux / systemd)."""
     interval_s  = int(interval_h * 3600)
     scope_label = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
     print_info(f"Scheduler started  scope: {C.BOLD}{scope_label}{C.RESET}  every {interval_h}h")
@@ -638,6 +756,43 @@ def workflow_backup_bot():
 
     except KeyboardInterrupt:
         print(f"\n  {C.R2}Scheduler stopped.{C.RESET}")
+
+def workflow_backup_bot():
+    print_header("Auto Backup to Telegram Bot (Scheduled)")
+
+    include_node = ask_backup_scope()
+
+    bot_token = input(f"  {C.R2}> Bot Token: {C.RESET}").strip()
+    while not bot_token:
+        bot_token = input(f"  {C.R1}Cannot be empty!{C.RESET}  {C.R2}> Bot Token: {C.RESET}").strip()
+
+    admin_id = input(f"  {C.R2}> Admin Chat ID (numeric): {C.RESET}").strip()
+    while not admin_id or not admin_id.lstrip("-").isdigit():
+        admin_id = input(f"  {C.R1}Invalid!{C.RESET}  {C.R2}> Admin Chat ID: {C.RESET}").strip()
+
+    try:
+        interval_h = float(input(f"  {C.R2}> Interval in hours (e.g. 1, 0.5): {C.RESET}").strip())
+    except ValueError:
+        print_warning("Invalid number. Defaulting to 1.0 hour.")
+        interval_h = 1.0
+
+    # Ask HOW the scheduler should survive after this SSH session ends,
+    # before the token/chat-id are used to actually start anything.
+    mode = ask_persistence_mode()
+
+    if mode == "1":
+        # Runs in the foreground of the current shell — will die with the SSH session.
+        run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node)
+        return
+
+    daemon_cmd = build_daemon_command(bot_token, admin_id, interval_h, include_node)
+
+    if mode == "2":
+        launch_via_screen(daemon_cmd)
+    elif mode == "3":
+        launch_via_tmux(daemon_cmd)
+    elif mode == "4":
+        launch_via_systemd(daemon_cmd)
 
 # ── Workflow 3: Manual local backup ──────────────────────────
 def workflow_manual_backup():
@@ -736,6 +891,17 @@ def workflow_manual_restore():
         print_error(f"Restore error: {e}")
         print_warning("System may be in a partially restored state.")
 
+# ── Headless daemon entrypoint (used by screen / tmux / systemd) ──
+def run_daemon_from_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--daemon-backup", action="store_true")
+    parser.add_argument("--token", required=True)
+    parser.add_argument("--chat", required=True)
+    parser.add_argument("--interval", type=float, required=True)
+    parser.add_argument("--node", action="store_true")
+    args = parser.parse_args()
+    run_scheduled_backup_loop(args.token, args.chat, args.interval, args.node)
+
 # ── Main menu ─────────────────────────────────────────────────
 MENU = [
     ("1", "Auto Backup & Transfer to New Server"),
@@ -781,4 +947,8 @@ def main():
             time.sleep(1.5)
 
 if __name__ == "__main__":
-    main()
+    if "--daemon-backup" in sys.argv:
+        # Re-invoked headlessly by screen / tmux / systemd — skip the interactive menu.
+        run_daemon_from_args()
+    else:
+        main()
