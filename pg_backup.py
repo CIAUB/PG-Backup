@@ -325,6 +325,60 @@ def launch_via_systemd(daemon_cmd):
     print_info(f"Stop it with:       systemctl stop {SYSTEMD_SERVICE_NAME}")
     return True
 
+# ── DB service auto-detection ──────────────────────────────────
+# The DB container is not always named "timescaledb" across PasarGuard
+# installs/forks — it can be postgres, postgresql, pgsql, db, etc.
+# We detect it once (from docker-compose.yml) and cache it for the
+# rest of the run instead of assuming a fixed name.
+_DB_SERVICE_CACHE = {}
+
+def _detect_db_service_local(d=None):
+    d = d or PASARGUARD_DIR
+    if d in _DB_SERVICE_CACHE:
+        return _DB_SERVICE_CACHE[d]
+    ok_v, out, _ = local_shell("docker compose config --services", cwd=d)
+    services = [l.strip() for l in out.splitlines() if l.strip()] if ok_v else []
+    svc = _pick_db_service(services)
+    _DB_SERVICE_CACHE[d] = svc
+    return svc
+
+def _detect_db_service_ssh(ssh, d=None):
+    d = d or PASARGUARD_DIR
+    key = ("ssh", d)
+    if key in _DB_SERVICE_CACHE:
+        return _DB_SERVICE_CACHE[key]
+    ec, out, _ = ssh_shell(ssh, f"cd {d} && docker compose config --services 2>/dev/null")
+    services = [l.strip() for l in out.splitlines() if l.strip()] if ec == 0 else []
+    svc = _pick_db_service(services)
+    _DB_SERVICE_CACHE[key] = svc
+    return svc
+
+def _pick_db_service(services):
+    """Pick the DB service name out of a list of compose services.
+    Falls back to asking the user if it can't decide on its own."""
+    if not services:
+        print_warning("Could not read docker-compose services — defaulting to 'timescaledb'.")
+        return "timescaledb"
+
+    if len(services) == 1:
+        return services[0]
+
+    keywords = ["timescaledb", "postgres", "postgresql", "pgsql", "db", "database"]
+    candidates = [s for s in services if any(k in s.lower() for k in keywords)]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    print_warning(f"Multiple candidate DB services found: {', '.join(candidates or services)}")
+    choice = input(f" {C.R2}> Which service is the PostgreSQL database? {C.RESET}").strip()
+    return choice if choice in services else (candidates[0] if candidates else services[0])
+
+def db_service_local(d=None):
+    return _detect_db_service_local(d)
+
+def db_service_ssh(ssh, d=None):
+    return _detect_db_service_ssh(ssh, d)
+
 # ── Docker compose helpers ────────────────────────────────────
 def _running_ids_local(d):
     _, out, _ = local_shell("docker compose ps -q --status running", cwd=d)
@@ -380,11 +434,12 @@ def stop_compose_ssh(ssh, d, label):
     return False
 
 def wait_postgres_local():
-    print_info("Waiting for timescaledb to become ready...")
+    svc = db_service_local()
+    print_info(f"Waiting for {svc} to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
         ok_v, _, _ = local_shell(
-            "docker compose exec -T timescaledb pg_isready -U pasarguard -d postgres", cwd=PASARGUARD_DIR)
+            f"docker compose exec -T {svc} pg_isready -U pasarguard -d postgres", cwd=PASARGUARD_DIR)
         if ok_v:
             print_success("Database is ready.")
             return True
@@ -393,11 +448,12 @@ def wait_postgres_local():
     return False
 
 def wait_postgres_ssh(ssh):
-    print_info("Waiting for timescaledb to become ready...")
+    svc = db_service_ssh(ssh)
+    print_info(f"Waiting for {svc} to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
         ec, _, _ = ssh_shell(
-            ssh, f"cd {PASARGUARD_DIR} && docker compose exec -T timescaledb pg_isready -U pasarguard -d postgres")
+            ssh, f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} pg_isready -U pasarguard -d postgres")
         if ec == 0:
             print_success("Database is ready.")
             return True
@@ -634,12 +690,13 @@ def create_backup(include_node=True):
             if os.path.exists(src):
                 shutil.copy(src, tmp_dir)
 
+        svc = db_service_local()
         print_info("Exporting PostgreSQL globals...")
-        run_command("docker compose exec -T timescaledb pg_dumpall -U pasarguard --globals-only",
+        run_command(f"docker compose exec -T {svc} pg_dumpall -U pasarguard --globals-only",
                     output_file=os.path.join(pg_dump_dir, "globals.sql"), cwd=PASARGUARD_DIR)
 
         print_info("Exporting PasarGuard database... (may take a while)")
-        run_command("docker compose exec -T timescaledb pg_dump -U pasarguard -d pasarguard",
+        run_command(f"docker compose exec -T {svc} pg_dump -U pasarguard -d pasarguard",
                     output_file=os.path.join(pg_dump_dir, "db-001.sql"), cwd=PASARGUARD_DIR)
 
         print_info("Writing manifest...")
@@ -741,6 +798,9 @@ def workflow_transfer():
 
         execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {zip_fn}",
                             "Extracting files")
+
+        remote_db_svc = db_service_ssh(ssh, PASARGUARD_DIR)
+        print_info(f"Detected database service: {remote_db_svc}")
         execute_ssh_command(ssh,
             "cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true "
             "&& rm -rf /opt/pasarguard/pasarguard_data",
@@ -757,23 +817,23 @@ def workflow_transfer():
                 "Restoring PG-Node data")
 
         if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB",
-                                  services=["timescaledb"], wait_postgres=True):
-            print_error("timescaledb did not start. Aborting.")
+                                  services=[remote_db_svc], wait_postgres=True):
+            print_error(f"{remote_db_svc} did not start. Aborting.")
             return
 
         execute_ssh_command(ssh,
-            'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres '
+            f'cd /opt/pasarguard && docker compose exec -T {remote_db_svc} psql -U pasarguard -d postgres '
             '-c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"',
             "Dropping old database")
         execute_ssh_command(ssh,
-            'cd /opt/pasarguard && docker compose exec -T timescaledb psql -U pasarguard -d postgres '
+            f'cd /opt/pasarguard && docker compose exec -T {remote_db_svc} psql -U pasarguard -d postgres '
             '-c "CREATE DATABASE pasarguard;"',
             "Creating fresh database")
         execute_ssh_command(ssh,
-            "cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T timescaledb psql -U pasarguard",
+            f"cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T {remote_db_svc} psql -U pasarguard",
             "Restoring globals.sql")
         execute_ssh_command(ssh,
-            "cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T timescaledb psql "
+            f"cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T {remote_db_svc} psql "
             "-U pasarguard -d pasarguard",
             "Restoring db-001.sql (may take a while for large DBs)")
 
@@ -936,29 +996,33 @@ def workflow_manual_restore():
             run_command("cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true")
             run_command("rm -rf /opt/pasarguard/pg_node_opt /opt/pasarguard/pg_node_data")
 
+        local_db_svc = db_service_local(PASARGUARD_DIR)
+        print_info(f"Detected database service: {local_db_svc}")
+
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard DB",
-                                    services=["timescaledb"], wait_postgres=True):
-            raise Exception("timescaledb did not start")
+                                    services=[local_db_svc], wait_postgres=True):
+            raise Exception(f"{local_db_svc} did not start")
 
         print_info("Dropping old database...")
-        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql '
+        if not run_command(f'cd /opt/pasarguard && docker compose exec -T {local_db_svc} psql '
                            '-U pasarguard -d postgres '
                            '-c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"'):
             raise Exception("Failed to drop old database")
 
         print_info("Creating fresh database...")
-        if not run_command('cd /opt/pasarguard && docker compose exec -T timescaledb psql '
+        if not run_command(f'cd /opt/pasarguard && docker compose exec -T {local_db_svc} psql '
                            '-U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"'):
             raise Exception("Failed to create database")
 
         print_info("Restoring globals.sql...")
-        if not run_command("cd /opt/pasarguard && cat pg_dump/globals.sql | "
-                           "docker compose exec -T timescaledb psql -U pasarguard"):
+        if not run_command(f"cd /opt/pasarguard && cat pg_dump/globals.sql | "
+                           f"docker compose exec -T {local_db_svc} psql -U pasarguard"):
             raise Exception("Failed to restore globals.sql")
 
         print_info("Restoring db-001.sql (may take a while)...")
-        if not run_command("cd /opt/pasarguard && cat pg_dump/db-001.sql | "
-                           "docker compose exec -T timescaledb psql -U pasarguard -d pasarguard"):
+        if not run_command(f"cd /opt/pasarguard && cat pg_dump/db-001.sql | "
+                           f"docker compose exec -T {local_db_svc} psql -U pasarguard -d pasarguard"):
+            raise Exception("Failed to restore db-001.sql")
             raise Exception("Failed to restore db-001.sql")
 
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
