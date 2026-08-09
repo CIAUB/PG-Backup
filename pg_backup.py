@@ -7,7 +7,7 @@
 
 import os, sys, subprocess, datetime, shutil
 import time, urllib.request, urllib.error, uuid, threading, itertools
-import argparse, shlex
+import argparse, shlex, socket
 
 # ── ANSI Colors ──────────────────────────────────────────────
 # Three red tones for hierarchy:
@@ -97,6 +97,24 @@ if "--daemon-backup" not in sys.argv:
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         import paramiko
         print(f"  {C.R1}[OK]{C.RESET}  {C.WH}Libraries installed successfully!{C.RESET}\n")
+
+# ── Auto-install PySocks (needed for SOCKS4/5 proxy support) ──
+# Unlike paramiko, this one is NOT skipped for the daemon child, since the
+# scheduled backup loop itself may need to reach Telegram through a SOCKS proxy.
+try:
+    import socks as _pysocks
+except ImportError:
+    if "--daemon-backup" not in sys.argv:
+        print(f"  {C.R2}[..]{C.RESET}  {C.WH}Installing PySocks (SOCKS proxy support)...{C.RESET}")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pysocks", "--quiet"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    try:
+        import socks as _pysocks
+    except ImportError:
+        _pysocks = None
 
 # ── Paths ────────────────────────────────────────────────────
 PASARGUARD_DIR      = "/opt/pasarguard"
@@ -197,7 +215,7 @@ def ensure_tool_installed(binary, pkg=None):
     print_error(f"Failed to install '{pkg}'. Please install it manually and try again.")
     return False
 
-def build_daemon_command(bot_token, admin_id, interval_h, include_node):
+def build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy=None):
     """Builds the exact CLI invocation used to re-run this same script headlessly."""
     script_path = os.path.abspath(__file__)
     parts = [
@@ -208,6 +226,8 @@ def build_daemon_command(bot_token, admin_id, interval_h, include_node):
     ]
     if include_node:
         parts.append("--node")
+    if proxy:
+        parts += ["--proxy", proxy]
     return " ".join(shlex.quote(p) for p in parts)
 
 def ask_persistence_mode():
@@ -474,7 +494,7 @@ def clean_dirs_ssh(ssh, include_node=True):
     return True
 
 # ── Telegram ─────────────────────────────────────────────────
-def send_telegram_file(token, chat_id, file_path, caption=""):
+def send_telegram_file(token, chat_id, file_path, caption="", proxy=None):
     url      = f"https://api.telegram.org/bot{token}/sendDocument"
     boundary = f"----WKF{uuid.uuid4().hex}"
     if not os.path.exists(file_path):
@@ -505,13 +525,72 @@ def send_telegram_file(token, chat_id, file_path, caption=""):
     req  = urllib.request.Request(url, data=body)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     req.add_header("Content-Length", str(len(body)))
+
+    opener, socks_ctx = None, None
+    if proxy:
+        scheme, host, port, user, pwd = _parse_proxy_url(proxy)
+        if scheme in ("socks5", "socks5h", "socks4", "socks4a"):
+            if _pysocks is None:
+                return False, "PySocks is required for SOCKS proxies but could not be installed"
+            proxy_type = _pysocks.SOCKS4 if scheme.startswith("socks4") else _pysocks.SOCKS5
+            rdns = scheme in ("socks5h", "socks4a")  # resolve hostname through the proxy
+            socks_ctx = _SocksProxySocket(proxy_type, host, port, user, pwd, rdns=rdns)
+        elif scheme in ("http", "https"):
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            return False, f"Unsupported proxy scheme: '{scheme}' (use http://, socks5:// or socks4://)"
+    if opener is None:
+        opener = urllib.request.build_opener()
+
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return True, r.read().decode()
+        if socks_ctx:
+            with socks_ctx:
+                with opener.open(req, timeout=60) as r:
+                    return True, r.read().decode()
+        else:
+            with opener.open(req, timeout=60) as r:
+                return True, r.read().decode()
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}: {e.read().decode()}"
     except Exception as e:
         return False, str(e)
+
+def _parse_proxy_url(proxy):
+    """scheme://[user[:pass]@]host:port -> (scheme, host, port, user, pass)"""
+    from urllib.parse import urlparse
+    p = urlparse(proxy)
+    return p.scheme.lower(), p.hostname, p.port, p.username, p.password
+
+class _SocksProxySocket:
+    """Temporarily routes socket.socket through a SOCKS4/5 proxy via PySocks,
+    then restores the original socket class no matter what happens."""
+    def __init__(self, proxy_type, host, port, username=None, password=None, rdns=True):
+        self.proxy_type = proxy_type
+        self.host, self.port = host, port
+        self.username, self.password = username, password
+        self.rdns = rdns
+        self._orig_socket = None
+
+    def __enter__(self):
+        self._orig_socket = socket.socket
+        _pysocks.set_default_proxy(self.proxy_type, self.host, self.port,
+                                    rdns=self.rdns, username=self.username, password=self.password)
+        socket.socket = _pysocks.socksocket
+        return self
+
+    def __exit__(self, *exc):
+        socket.socket = self._orig_socket
+        return False
+
+def ask_telegram_proxy():
+    ans = input(f" {C.R2}> Use a proxy for Telegram upload? (y/n): {C.RESET}").strip().lower()
+    if ans != "y":
+        return None
+    proxy = input(
+        f" {C.R2}> Proxy address (e.g. http://127.0.0.1:10809 or socks5h://127.0.0.1:1080): {C.RESET}"
+    ).strip()
+    return proxy or None
 
 # ── Backup scope selector ─────────────────────────────────────
 def ask_backup_scope():
@@ -611,10 +690,11 @@ def workflow_transfer():
     if send_tg == "y":
         bot_token = input(f"  {C.R2}> Bot Token: {C.RESET}").strip()
         admin_id  = input(f"  {C.R2}> Admin Chat ID: {C.RESET}").strip()
+        proxy = ask_telegram_proxy()
         print_info("Uploading to Telegram...")
         cap = (f"PasarGuard {'+ PG-Node ' if include_node else ''}Manual Transfer Backup\n"
                f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        success, details = send_telegram_file(bot_token, admin_id, zip_path, cap)
+        success, details = send_telegram_file(bot_token, admin_id, zip_path, cap, proxy)
         if success: print_success("Sent to Telegram!")
         else:       print_error(f"Telegram upload failed: {details}")
 
@@ -720,7 +800,7 @@ def workflow_transfer():
             pass
 
 # ── Workflow 2: Scheduled Telegram backup ────────────────────
-def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node):
+def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy=None):
     """The actual recurring backup+upload loop. Shared by the interactive
     'None' persistence mode and the headless --daemon-backup entrypoint
     (used by screen / tmux / systemd)."""
@@ -740,7 +820,7 @@ def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node):
                 print_info("Uploading to Telegram...")
                 cap = (f"PasarGuard {'+ PG-Node ' if include_node else ''}Auto Backup\n"
                        f"Date: {now_str}\nInterval: {interval_h}h")
-                success, details = send_telegram_file(bot_token, admin_id, zip_path, cap)
+                success, details = send_telegram_file(bot_token, admin_id, zip_path, cap, proxy)
                 if success: print_success("Backup sent to Telegram!")
                 else:       print_error(f"Send failed: {details}")
                 try:
@@ -770,6 +850,8 @@ def workflow_backup_bot():
     while not admin_id or not admin_id.lstrip("-").isdigit():
         admin_id = input(f"  {C.R1}Invalid!{C.RESET}  {C.R2}> Admin Chat ID: {C.RESET}").strip()
 
+    proxy = ask_telegram_proxy()
+
     try:
         interval_h = float(input(f"  {C.R2}> Interval in hours (e.g. 1, 0.5): {C.RESET}").strip())
     except ValueError:
@@ -782,10 +864,10 @@ def workflow_backup_bot():
 
     if mode == "1":
         # Runs in the foreground of the current shell — will die with the SSH session.
-        run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node)
+        run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy)
         return
 
-    daemon_cmd = build_daemon_command(bot_token, admin_id, interval_h, include_node)
+    daemon_cmd = build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy)
 
     if mode == "2":
         launch_via_screen(daemon_cmd)
@@ -899,8 +981,9 @@ def run_daemon_from_args():
     parser.add_argument("--chat", required=True)
     parser.add_argument("--interval", type=float, required=True)
     parser.add_argument("--node", action="store_true")
+    parser.add_argument("--proxy", default=None)
     args = parser.parse_args()
-    run_scheduled_backup_loop(args.token, args.chat, args.interval, args.node)
+    run_scheduled_backup_loop(args.token, args.chat, args.interval, args.node, args.proxy)
 
 # ── Main menu ─────────────────────────────────────────────────
 MENU = [
