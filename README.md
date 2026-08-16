@@ -262,7 +262,8 @@ backup_full_YYYYMMDDHHMMSS.zip
 
 # 📞 ارتباط با توسعه‌دهنده
 
-* 👨‍💻 Telegram: https://t.me/VCIAU
+* 👨‍💻 Telegram: https://t.me/CIAUB
+  
 * 🐙 GitHub: https://github.com/CIAUB
 
 ---
