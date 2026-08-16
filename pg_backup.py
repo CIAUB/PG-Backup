@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================
 #   Pasarguard Backup Utility  v3.2
-#   Dev by: EOAMIR
-#   GitHub: https://github.com/EOAMIR
+#   Dev by: CIA
+#   GitHub: https://github.com/CIAUB
 # ============================================================
 
 import os, sys, subprocess, datetime, shutil
@@ -150,7 +150,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 3 . 2   -   E O A M I R" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 3 . 2   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
