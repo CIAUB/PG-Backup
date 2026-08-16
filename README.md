@@ -4,14 +4,16 @@
 
 ### Professional Backup, Restore & Migration Utility for PasarGuard & PG-Node
 
-![Version](https://img.shields.io/badge/Version-v3.2-blue)
-![Python](https://img.shields.io/badge/Python-3.8+-green)
-![Platform](https://img.shields.io/badge/Platform-Linux-orange)
-![Docker](https://img.shields.io/badge/Docker-Supported-2496ED)
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supported-336791)
-![Telegram](https://img.shields.io/badge/Telegram-Automation-26A5E4)
-![SSH](https://img.shields.io/badge/SSH-Migration-success)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;PostgreSQL+%26+Docker+Automation" alt="Typing SVG" />
+
+![Version](https://img.shields.io/badge/Version-v3.2-8B0000)
+![Python](https://img.shields.io/badge/Python-3.8+-8B0000)
+![Platform](https://img.shields.io/badge/Platform-Linux-8B0000)
+![Docker](https://img.shields.io/badge/Docker-Supported-8B0000)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supported-8B0000)
+![Telegram](https://img.shields.io/badge/Telegram-Automation-8B0000)
+![SSH](https://img.shields.io/badge/SSH-Migration-8B0000)
+![License](https://img.shields.io/badge/License-MIT-8B0000)
 
 Backup • Restore • Migration • Telegram Automation • PostgreSQL • Docker
 
@@ -49,13 +51,13 @@ Backup • Restore • Migration • Telegram Automation • PostgreSQL • Dock
 برای نصب PG-Backup کافی است دستور زیر را با دسترسی Root اجرا کنید:
 
 ```bash
-sudo bash -c "$(curl -sL https://raw.githubusercontent.com/EOAMIR/PG-Backup/main/install.sh)"
+sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/install.sh)"
 ```
 
 در صورتی که لینک اصلی در دسترس نبود:
 
 ```bash
-sudo bash -c "$(curl -sL https://raw.githack.com/EOAMIR/PG-Backup/main/install.sh)"
+sudo bash -c "$(curl -sL https://raw.githack.com/CIAUB/PG-Backup/main/install.sh)"
 ```
 
 > 💡 لینک دوم از CDN جایگزین استفاده می‌کند و در برخی شبکه‌ها پایداری بیشتری دارد.
@@ -252,10 +254,16 @@ backup_full_YYYYMMDDHHMMSS.zip
 
 ---
 
+<p align="center">
+<img src="https://raw.githubusercontent.com/CIAUB/CIAUB/main/sharingan.jpg" width="500" alt="Sharingan" />
+</p>
+
+---
+
 # 📞 ارتباط با توسعه‌دهنده
 
-* 👨‍💻 Telegram: https://t.me/EOAMIR
-* 🐙 GitHub: https://github.com/EOAMIR
+* 👨‍💻 Telegram: https://t.me/VCIAU
+* 🐙 GitHub: https://github.com/CIAUB
 
 ---
 
@@ -265,6 +273,6 @@ backup_full_YYYYMMDDHHMMSS.zip
 
 ---
 
-<sub><sub>Developed by EOAMIR</sub></sub>
+<sub><sub>Developed by CIAUB</sub></sub>
 
 </div>
