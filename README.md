@@ -6,7 +6,7 @@
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;PostgreSQL+%26+Docker+Automation" alt="Typing SVG" />
 
-![Version](https://img.shields.io/badge/Version-v3.2-8B0000)
+![Version](https://img.shields.io/badge/Version-v3.3-8B0000)
 ![Python](https://img.shields.io/badge/Python-3.8+-8B0000)
 ![Platform](https://img.shields.io/badge/Platform-Linux-8B0000)
 ![Docker](https://img.shields.io/badge/Docker-Supported-8B0000)
@@ -81,7 +81,9 @@ PG-Backup
 2 ─ 🤖 Auto Backup to Telegram Bot (Scheduled)
 3 ─ 💾 Manual Backup (Save Locally)
 4 ─ 🔄 Manual Restore (From Local ZIP)
-5 ─ 🚪 Exit
+5 ─ 🧭 Manage Backup Schedulers (Start / Stop / Restart)
+6 ─ ⬆️ Update to Latest Version
+7 ─ 🚪 Exit
 ```
 
 ---
@@ -161,17 +163,36 @@ Telegram Chat ID (Optional)
 24 Hours
 ```
 
-برای اجرای دائمی:
+### ماندگاری بعد از بستن SSH
 
-```bash
-screen -S pg-backup pg-backup
+هنگام تنظیم بکاپ زمان‌بندی‌شده، ابزار می‌پرسد که شِدیولر بعد از بسته‌شدن سشن SSH چطور زنده بماند:
+
+```text
+1 ─ None      (فقط تا وقتی همین ترمینال بازه)
+2 ─ screen    (سشن screen جدا در پس‌زمینه)
+3 ─ tmux      (سشن tmux جدا در پس‌زمینه)
+4 ─ systemd   (سرویس پس‌زمینه، حتی بعد از ری‌بوت هم زنده می‌مونه)
 ```
 
-یا:
+برای گزینه‌های ۲ تا ۴ یک **نام نمونه (Instance Name)** هم پرسیده می‌شود (مثلاً `pasarguard-backup-1`، `pasarguard-backup-2`)، تا بشود چند شِدیولر را هم‌زمان و بدون قاطی‌شدن با هم اجرا کرد — مثلاً یکی برای هر سرور یا هر بازه‌ی زمانی. اسم پیشنهادی به‌صورت خودکار افزایش پیدا می‌کند، اما می‌شود اسم دلخواه هم گذاشت.
 
-```bash
-nohup pg-backup > backup.log 2>&1 &
+---
+
+# 🧭 مدیریت شِدیولرها
+
+از منوی اصلی (گزینه ۵) می‌توان همه‌ی شِدیولرهای فعال یا نصب‌شده (systemd / screen / tmux) را مشاهده و مدیریت کرد، بدون نیاز به دانستن دستورات `systemctl`/`screen`/`tmux`:
+
+```text
+[systemd] pasarguard-backup-1   RUNNING   (sleeping — 50m until next backup)
+[systemd] pasarguard-backup-2   RUNNING   (backing up now)
+[screen ] pasarguard_backup-3   RUNNING
 ```
+
+برای هر شِدیولر می‌توان:
+
+* 🔁 **Restart** (فقط systemd)
+* ⏹️ **Stop**
+* 🗑️ **Remove** (حذف کامل، شامل حذف unit file برای systemd)
 
 ---
 
@@ -241,6 +262,18 @@ backup_full_YYYYMMDDHHMMSS.zip
 | ---------- | ----------------- | --------------------- |
 | PasarGuard | `/opt/pasarguard` | `/var/lib/pasarguard` |
 | PG-Node    | `/opt/pg-node`    | `/var/lib/pg-node`    |
+
+---
+
+# ⬆️ آپدیت به آخرین نسخه
+
+از منوی اصلی (گزینه ۶) می‌توان مستقیم از داخل ابزار به آخرین نسخه آپدیت کرد؛ همان دستور نصب دوباره اجرا می‌شود:
+
+```bash
+sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/install.sh)"
+```
+
+> 💡 شِدیولرهایی که از قبل در حال اجرا هستند (screen/tmux/systemd) کد نسخه‌ی قبلی را در حافظه دارند؛ بعد از آپدیت، از منوی «مدیریت شِدیولرها» آن‌ها را Restart کنید تا نسخه‌ی جدید فعال شود.
 
 ---
 
