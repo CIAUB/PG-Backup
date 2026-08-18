@@ -134,6 +134,33 @@ TMUX_SESSION_BASE      = "pasarguard_backup"
 SYSTEMD_SERVICE_BASE   = "pasarguard-backup"
 SYSTEMD_UNIT_DIR       = "/etc/systemd/system"
 
+# Per-instance status files so the "Manage Backup Schedulers" menu can show
+# whether an instance is currently backing up or sleeping until its next run,
+# instead of just a raw process-alive check.
+STATE_DIR = "/tmp/pasarguard_backup_state"
+
+def _state_file(instance):
+    return os.path.join(STATE_DIR, f"{instance}.state")
+
+def write_state(instance, phase, extra=""):
+    if not instance:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(_state_file(instance), "w") as f:
+            f.write(f"{phase}|{extra}|{time.time()}")
+    except Exception:
+        pass
+
+def read_state(instance):
+    """Returns (phase, extra, age_seconds) or None."""
+    try:
+        with open(_state_file(instance)) as f:
+            phase, extra, ts = f.read().split("|", 2)
+        return phase, extra, time.time() - float(ts)
+    except Exception:
+        return None
+
 # ── Logo / Header ────────────────────────────────────────────
 LOGO = [
     "██████╗  ██████╗ ██████╗  █████╗  ██████╗██╗  ██╗██╗   ██╗██████╗ ",
@@ -215,7 +242,7 @@ def ensure_tool_installed(binary, pkg=None):
     print_error(f"Failed to install '{pkg}'. Please install it manually and try again.")
     return False
 
-def build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy=None):
+def build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy=None, instance=None):
     """Builds the exact CLI invocation used to re-run this same script headlessly."""
     script_path = os.path.abspath(__file__)
     parts = [
@@ -228,6 +255,8 @@ def build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy=No
         parts.append("--node")
     if proxy:
         parts += ["--proxy", proxy]
+    if instance:
+        parts += ["--instance", instance]
     return " ".join(shlex.quote(p) for p in parts)
 
 def systemd_unit_name(suffix):
@@ -256,7 +285,11 @@ def list_systemd_backup_units():
             if not name.startswith(SYSTEMD_SERVICE_BASE + "-"):
                 continue
             suffix = name[len(SYSTEMD_SERVICE_BASE) + 1:]
-            active = len(parts) > 2 and parts[2] == "running"
+            # columns are: UNIT LOAD ACTIVE SUB DESCRIPTION...
+            # parts[2] = ACTIVE ("active"/"inactive"), parts[3] = SUB ("running"/"dead"/...)
+            # Checking parts[2] here was the bug that made a perfectly healthy,
+            # sleeping-between-backups service show up as STOPPED.
+            active = len(parts) > 3 and parts[2] == "active" and parts[3] in ("running", "start-pre", "start")
             units.append((suffix, name, active))
     return units
 
@@ -969,7 +1002,7 @@ def workflow_transfer():
             pass
 
 # ── Workflow 2: Scheduled Telegram backup ────────────────────
-def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy=None):
+def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy=None, instance=None):
     """The actual recurring backup+upload loop. Shared by the interactive
     'None' persistence mode and the headless --daemon-backup entrypoint
     (used by screen / tmux / systemd)."""
@@ -982,6 +1015,7 @@ def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, pro
     try:
         while True:
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            write_state(instance, "backing_up", now_str)
             print(f"\n  {C.R2}[..]{C.RESET}  {C.WH}Starting scheduled backup at {now_str}...{C.RESET}")
 
             zip_path = create_backup(include_node)
@@ -1000,10 +1034,13 @@ def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, pro
             else:
                 print_error("Backup failed — skipping upload.")
 
-            print_info(f"Sleeping {interval_h}h...")
+            next_run = datetime.datetime.now() + datetime.timedelta(seconds=interval_s)
+            write_state(instance, "sleeping", next_run.strftime("%Y-%m-%d %H:%M:%S"))
+            print_info(f"Sleeping {interval_h}h... (next backup at {next_run.strftime('%Y-%m-%d %H:%M:%S')})")
             time.sleep(interval_s)
 
     except KeyboardInterrupt:
+        write_state(instance, "stopped", "")
         print(f"\n  {C.R2}Scheduler stopped.{C.RESET}")
 
 def workflow_backup_bot():
@@ -1036,14 +1073,23 @@ def workflow_backup_bot():
         run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy)
         return
 
-    daemon_cmd = build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy)
+    kind_by_mode = {"2": "screen", "3": "tmux", "4": "systemd"}
+    kind = kind_by_mode[mode]
+
+    # Pick the instance name BEFORE building the daemon command, so the
+    # child process knows its own name and can report its status (backing
+    # up / sleeping) back to the 'Manage Backup Schedulers' menu, and so
+    # several instances (e.g. -1, -2) can run side by side without clashing.
+    instance_name = ask_instance_name(kind)
+    daemon_cmd = build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy,
+                                       instance=instance_name)
 
     if mode == "2":
-        launch_via_screen(daemon_cmd)
+        launch_via_screen(daemon_cmd, session_name=instance_name)
     elif mode == "3":
-        launch_via_tmux(daemon_cmd)
+        launch_via_tmux(daemon_cmd, session_name=instance_name)
     elif mode == "4":
-        launch_via_systemd(daemon_cmd)
+        launch_via_systemd(daemon_cmd, unit_name=instance_name)
 
 # ── Workflow 3: Manual local backup ──────────────────────────
 def workflow_manual_backup():
@@ -1153,6 +1199,26 @@ def workflow_manual_restore():
 def _systemctl_action(unit_name, action, quiet=False):
     return run_command(f"systemctl {action} {unit_name}.service", quiet=quiet)
 
+def _format_remaining(target_str):
+    """Turn a 'YYYY-mm-dd HH:MM:SS' target into a short remaining-time label
+    like '50m', '1h', '1h 20m', or 'now' if it's already due/passed."""
+    try:
+        target = datetime.datetime.strptime(target_str, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return target_str
+    remaining = (target - datetime.datetime.now()).total_seconds()
+    if remaining <= 0:
+        return "now"
+    total_min = int(remaining // 60)
+    h, m = divmod(total_min, 60)
+    if h > 0 and m > 0:
+        return f"{h}h {m}m"
+    if h > 0:
+        return f"{h}h"
+    if m > 0:
+        return f"{m}m"
+    return "<1m"
+
 def workflow_manage_schedulers():
     print_header("Manage Backup Schedulers")
 
@@ -1172,7 +1238,17 @@ def workflow_manage_schedulers():
     print(f"  {C.R2}Scheduler instances found:{C.RESET}\n")
     for i, (kind, name, active) in enumerate(items, 1):
         status = f"{C.R1}RUNNING{C.RESET}" if active else f"{C.R3}STOPPED{C.RESET}"
-        print(f"  {C.R1}{i}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}[{kind:<7}] {name}{C.RESET}   {status}")
+        phase_note = ""
+        st = read_state(name)
+        if st:
+            phase, extra, age = st
+            if phase == "backing_up" and age < 3600:
+                phase_note = f"  {C.R1}(backing up now){C.RESET}"
+            elif phase == "sleeping" and extra:
+                phase_note = f"  {C.R3}(sleeping — {_format_remaining(extra)} until next backup){C.RESET}"
+            elif phase == "stopped":
+                phase_note = f"  {C.R3}(stopped by Ctrl+C){C.RESET}"
+        print(f"  {C.R1}{i}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}[{kind:<7}] {name}{C.RESET}   {status}{phase_note}")
     print()
 
     choice = input(f"  {C.R2}> Select a number to manage (ENTER to cancel): {C.RESET}").strip()
@@ -1249,6 +1325,37 @@ def workflow_manage_schedulers():
     else:
         print_warning("Cancelled.")
 
+# ── Workflow 6: Update to latest version ──────────────────────
+UPDATE_CMD = 'sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/install.sh)"'
+
+def workflow_update():
+    print_header("Update PG-Backup to Latest Version")
+    print_warning("This downloads and runs the official installer/updater from GitHub (CIAUB/PG-Backup).")
+    print_info(f"Command: {UPDATE_CMD}")
+    confirm = input(f"  {C.R2}> Proceed with update? (y/n): {C.RESET}").strip().lower()
+    if confirm != "y":
+        print_warning("Aborted.")
+        return
+
+    print()
+    print(hline())
+    try:
+        result = subprocess.run(UPDATE_CMD, shell=True)
+    except Exception as e:
+        print_error(f"Failed to run updater: {e}")
+        return
+    print(hline())
+    print()
+
+    if result.returncode == 0:
+        print_success("Update finished.")
+        print_info("Existing running scheduler instances (screen/tmux/systemd) keep running")
+        print_info("with the old code in memory — restart them from 'Manage Backup Schedulers'")
+        print_info("if you want them to pick up the new version.")
+        print_info("Re-run this script to use the updated version.")
+    else:
+        print_error(f"Updater exited with code {result.returncode}. Check the output above.")
+
 # ── Headless daemon entrypoint (used by screen / tmux / systemd) ──
 def run_daemon_from_args():
     parser = argparse.ArgumentParser(add_help=False)
@@ -1258,8 +1365,9 @@ def run_daemon_from_args():
     parser.add_argument("--interval", type=float, required=True)
     parser.add_argument("--node", action="store_true")
     parser.add_argument("--proxy", default=None)
+    parser.add_argument("--instance", default=None)
     args = parser.parse_args()
-    run_scheduled_backup_loop(args.token, args.chat, args.interval, args.node, args.proxy)
+    run_scheduled_backup_loop(args.token, args.chat, args.interval, args.node, args.proxy, args.instance)
 
 # ── Main menu ─────────────────────────────────────────────────
 MENU = [
@@ -1268,7 +1376,8 @@ MENU = [
     ("3", "Manual Backup (Save locally)"),
     ("4", "Manual Restore (From local zip)"),
     ("5", "Manage Backup Schedulers (start/stop/restart)"),
-    ("6", "Exit"),
+    ("6", "Update to Latest Version"),
+    ("7", "Exit"),
 ]
 
 def main():
@@ -1277,14 +1386,14 @@ def main():
 
         print(f"  {C.R3}{'─' * 50}{C.RESET}")
         for num, label in MENU:
-            if num == "6":
+            if num == "7":
                 print(f"  {C.R3}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.R2}{label}{C.RESET}")
             else:
                 print(f"  {C.R1}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}{label}{C.RESET}")
         print(f"  {C.R3}{'─' * 50}{C.RESET}")
         print()
 
-        choice = input(f"  {C.R2}> Select option (1-6): {C.RESET}").strip()
+        choice = input(f"  {C.R2}> Select option (1-7): {C.RESET}").strip()
         print()
 
         if choice == "1":
@@ -1303,10 +1412,13 @@ def main():
             workflow_manage_schedulers()
             pause_and_return()
         elif choice == "6":
+            workflow_update()
+            pause_and_return()
+        elif choice == "7":
             print(f"  {C.R2}Goodbye.{C.RESET}\n")
             sys.exit(0)
         else:
-            print_error("Invalid option. Please enter 1-6.")
+            print_error("Invalid option. Please enter 1-7.")
             time.sleep(1.5)
 
 if __name__ == "__main__":
