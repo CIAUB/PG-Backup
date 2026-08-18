@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v3.2
+#   Pasarguard Backup Utility  v3.3
 #   Dev by: CIA
 #   GitHub: https://github.com/CIAUB
 # ============================================================
