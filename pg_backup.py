@@ -177,7 +177,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 3 . 2   -   C I A U B" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 3 . 3   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
