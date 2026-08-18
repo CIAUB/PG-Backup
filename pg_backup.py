@@ -129,10 +129,10 @@ COMPOSE_UP_MAX_WAIT     = 120
 COMPOSE_UP_INTERVAL     = 3
 COMPOSE_STOP_RETRIES    = 3
 
-SCREEN_SESSION_NAME    = "pasarguard_backup"
-TMUX_SESSION_NAME      = "pasarguard_backup"
-SYSTEMD_SERVICE_NAME   = "pasarguard-backup"
-SYSTEMD_SERVICE_PATH   = f"/etc/systemd/system/{SYSTEMD_SERVICE_NAME}.service"
+SCREEN_SESSION_BASE    = "pasarguard_backup"
+TMUX_SESSION_BASE      = "pasarguard_backup"
+SYSTEMD_SERVICE_BASE   = "pasarguard-backup"
+SYSTEMD_UNIT_DIR       = "/etc/systemd/system"
 
 # ── Logo / Header ────────────────────────────────────────────
 LOGO = [
@@ -230,6 +230,106 @@ def build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy=No
         parts += ["--proxy", proxy]
     return " ".join(shlex.quote(p) for p in parts)
 
+def systemd_unit_name(suffix):
+    return f"{SYSTEMD_SERVICE_BASE}-{suffix}"
+
+def systemd_unit_path(suffix):
+    return f"{SYSTEMD_UNIT_DIR}/{systemd_unit_name(suffix)}.service"
+
+def list_systemd_backup_units():
+    """Return [(suffix, unit_name, active_bool), ...] for every installed
+    pasarguard-backup-* systemd service (so multiple schedulers can coexist)."""
+    if shutil.which("systemctl") is None:
+        return []
+    ok_v, out, _ = local_shell(
+        f"systemctl list-units --all --type=service --no-legend --plain '{SYSTEMD_SERVICE_BASE}-*.service' 2>/dev/null")
+    units = []
+    if ok_v and out:
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            unit = parts[0]
+            if not unit.endswith(".service"):
+                continue
+            name = unit[:-len(".service")]
+            if not name.startswith(SYSTEMD_SERVICE_BASE + "-"):
+                continue
+            suffix = name[len(SYSTEMD_SERVICE_BASE) + 1:]
+            active = len(parts) > 2 and parts[2] == "running"
+            units.append((suffix, name, active))
+    return units
+
+def list_screen_sessions():
+    ok_v, out, _ = local_shell("screen -list 2>/dev/null")
+    names = []
+    if ok_v and out:
+        import re
+        for line in out.splitlines():
+            m = re.search(r"\d+\.(" + re.escape(SCREEN_SESSION_BASE) + r"(?:-[^\s]+)?)", line)
+            if m:
+                names.append(m.group(1))
+    return names
+
+def list_tmux_sessions():
+    ok_v, out, _ = local_shell("tmux list-sessions -F '#{session_name}' 2>/dev/null")
+    names = []
+    if ok_v and out:
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith(TMUX_SESSION_BASE):
+                names.append(line)
+    return names
+
+def next_free_suffix(existing_names, base):
+    """Given a list of full names like 'pasarguard-backup-2', find the
+    lowest free numeric suffix (1, 2, 3, ...) not already taken."""
+    taken = set()
+    for n in existing_names:
+        if n.startswith(base + "-"):
+            taken.add(n[len(base) + 1:])
+        elif n == base:
+            taken.add("")
+    i = 1
+    while str(i) in taken:
+        i += 1
+    return str(i)
+
+def ask_instance_name(kind):
+    """Ask the user for a name/suffix for a new scheduler instance so several
+    can run side by side (e.g. pasarguard-backup-1, pasarguard-backup-2)
+    without clashing. Shows what already exists and lets the user rename
+    to avoid collisions."""
+    if kind == "systemd":
+        base = SYSTEMD_SERVICE_BASE
+        existing_full = [name for _, name, _ in list_systemd_backup_units()]
+    elif kind == "screen":
+        base = SCREEN_SESSION_BASE
+        existing_full = list_screen_sessions()
+    else:
+        base = TMUX_SESSION_BASE
+        existing_full = list_tmux_sessions()
+
+    if existing_full:
+        print_info(f"Existing {kind} schedulers: {', '.join(existing_full)}")
+
+    suggested_suffix = next_free_suffix(existing_full, base)
+    suggested_name    = f"{base}-{suggested_suffix}"
+
+    print(f"  {C.R2}Give this scheduler instance a name so it can run alongside others.{C.RESET}")
+    name = input(f"  {C.R2}> Instance name [{suggested_name}]: {C.RESET}").strip()
+    if not name:
+        return suggested_name
+
+    full_name = name if name.startswith(base) else f"{base}-{name}"
+    while full_name in existing_full:
+        print_error(f"'{full_name}' is already in use — pick another name.")
+        name = input(f"  {C.R2}> Instance name [{suggested_name}]: {C.RESET}").strip()
+        if not name:
+            return suggested_name
+        full_name = name if name.startswith(base) else f"{base}-{name}"
+    return full_name
+
 def ask_persistence_mode():
     print()
     print(f"  {C.R2}How should the scheduler keep running after this SSH session closes?{C.RESET}")
@@ -245,51 +345,58 @@ def ask_persistence_mode():
             return choice
         print_error("Invalid choice. Enter 1, 2, 3 or 4.")
 
-def launch_via_screen(daemon_cmd):
+def launch_via_screen(daemon_cmd, session_name=None):
     if not ensure_tool_installed("screen"):
         return False
-    exists, _, _ = local_shell(f"screen -list | grep -q '\\.{SCREEN_SESSION_NAME}\\b'")
+    session_name = session_name or ask_instance_name("screen")
+    exists, _, _ = local_shell(f"screen -list | grep -q '\\.{session_name}\\b'")
     if exists:
-        print_warning(f"A screen session named '{SCREEN_SESSION_NAME}' already exists.")
+        print_warning(f"A screen session named '{session_name}' already exists.")
         kill_it = input(f"  {C.R2}> Kill it and start a fresh one? (y/n): {C.RESET}").strip().lower()
         if kill_it != "y":
             print_warning("Aborted — leaving the existing session untouched.")
             return False
-        run_command(f"screen -S {SCREEN_SESSION_NAME} -X quit", quiet=True)
-    if not run_command(f"screen -dmS {SCREEN_SESSION_NAME} {daemon_cmd}"):
+        run_command(f"screen -S {session_name} -X quit", quiet=True)
+    if not run_command(f"screen -dmS {session_name} {daemon_cmd}"):
         print_error("Failed to start the screen session.")
         return False
-    print_success(f"Scheduler started in detached screen session '{SCREEN_SESSION_NAME}'.")
-    print_info(f"Reattach anytime with:  screen -r {SCREEN_SESSION_NAME}")
-    print_info(f"Stop it with:           screen -S {SCREEN_SESSION_NAME} -X quit")
+    print_success(f"Scheduler started in detached screen session '{session_name}'.")
+    print_info(f"Reattach anytime with:  screen -r {session_name}")
+    print_info(f"Stop it with:           screen -S {session_name} -X quit")
+    print_info("Tip: use menu option 'Manage Backup Schedulers' to stop/restart/remove it safely.")
     return True
 
-def launch_via_tmux(daemon_cmd):
+def launch_via_tmux(daemon_cmd, session_name=None):
     if not ensure_tool_installed("tmux"):
         return False
-    exists, _, _ = local_shell(f"tmux has-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+    session_name = session_name or ask_instance_name("tmux")
+    exists, _, _ = local_shell(f"tmux has-session -t {session_name} 2>/dev/null")
     if exists:
-        print_warning(f"A tmux session named '{TMUX_SESSION_NAME}' already exists.")
+        print_warning(f"A tmux session named '{session_name}' already exists.")
         kill_it = input(f"  {C.R2}> Kill it and start a fresh one? (y/n): {C.RESET}").strip().lower()
         if kill_it != "y":
             print_warning("Aborted — leaving the existing session untouched.")
             return False
-        run_command(f"tmux kill-session -t {TMUX_SESSION_NAME}", quiet=True)
-    if not run_command(f"tmux new-session -d -s {TMUX_SESSION_NAME} {daemon_cmd}"):
+        run_command(f"tmux kill-session -t {session_name}", quiet=True)
+    if not run_command(f"tmux new-session -d -s {session_name} {daemon_cmd}"):
         print_error("Failed to start the tmux session.")
         return False
-    print_success(f"Scheduler started in detached tmux session '{TMUX_SESSION_NAME}'.")
-    print_info(f"Reattach anytime with:  tmux attach -t {TMUX_SESSION_NAME}")
-    print_info(f"Stop it with:           tmux kill-session -t {TMUX_SESSION_NAME}")
+    print_success(f"Scheduler started in detached tmux session '{session_name}'.")
+    print_info(f"Reattach anytime with:  tmux attach -t {session_name}")
+    print_info(f"Stop it with:           tmux kill-session -t {session_name}")
+    print_info("Tip: use menu option 'Manage Backup Schedulers' to stop/restart/remove it safely.")
     return True
 
-def launch_via_systemd(daemon_cmd):
+def launch_via_systemd(daemon_cmd, unit_name=None):
     if shutil.which("systemctl") is None:
         print_error("systemctl not found — this server does not appear to use systemd.")
         return False
+    if unit_name is None:
+        unit_name = ask_instance_name("systemd")
+    unit_path = f"{SYSTEMD_UNIT_DIR}/{unit_name}.service"
     unit = (
         "[Unit]\n"
-        "Description=PasarGuard Scheduled Backup\n"
+        f"Description=PasarGuard Scheduled Backup ({unit_name})\n"
         "After=network-online.target docker.service\n"
         "Wants=network-online.target\n\n"
         "[Service]\n"
@@ -302,7 +409,7 @@ def launch_via_systemd(daemon_cmd):
         "WantedBy=multi-user.target\n"
     )
     try:
-        with open(SYSTEMD_SERVICE_PATH, "w") as f:
+        with open(unit_path, "w") as f:
             f.write(unit)
     except Exception as e:
         print_error(f"Could not write unit file: {e}")
@@ -311,18 +418,20 @@ def launch_via_systemd(daemon_cmd):
     print_info("Reloading systemd and enabling the service...")
     steps = [
         ("systemctl daemon-reload", "daemon-reload"),
-        (f"systemctl enable {SYSTEMD_SERVICE_NAME}", "enable"),
-        (f"systemctl restart {SYSTEMD_SERVICE_NAME}", "start"),
+        (f"systemctl enable {unit_name}", "enable"),
+        (f"systemctl restart {unit_name}", "start"),
     ]
     for cmd, label in steps:
         if not run_command(cmd):
             print_error(f"systemctl {label} failed.")
             return False
 
-    print_success(f"Scheduler installed as systemd service '{SYSTEMD_SERVICE_NAME}'.")
-    print_info(f"Check status with:  systemctl status {SYSTEMD_SERVICE_NAME}")
-    print_info(f"Live logs with:     journalctl -u {SYSTEMD_SERVICE_NAME} -f")
-    print_info(f"Stop it with:       systemctl stop {SYSTEMD_SERVICE_NAME}")
+    print_success(f"Scheduler installed as systemd service '{unit_name}'.")
+    print_info(f"Check status with:  systemctl status {unit_name}")
+    print_info(f"Live logs with:     journalctl -u {unit_name} -f")
+    print_info(f"Stop it with:       systemctl stop {unit_name}")
+    print_info("Tip: use menu option 'Manage Backup Schedulers' to stop/restart/remove it safely,")
+    print_info("     and you can install another instance alongside this one (e.g. -2, -3, ...).")
     return True
 
 # ── DB service auto-detection ──────────────────────────────────
@@ -1037,6 +1146,109 @@ def workflow_manual_restore():
         print_error(f"Restore error: {e}")
         print_warning("System may be in a partially restored state.")
 
+# ── Workflow 5: Manage running/installed schedulers ───────────
+# Lets a non-technical user see every scheduler instance (systemd/screen/tmux)
+# that keeps running after SSH disconnects, and safely restart/stop/remove it
+# — without having to touch systemctl/screen/tmux commands by hand.
+def _systemctl_action(unit_name, action, quiet=False):
+    return run_command(f"systemctl {action} {unit_name}.service", quiet=quiet)
+
+def workflow_manage_schedulers():
+    print_header("Manage Backup Schedulers")
+
+    items = []  # (kind, name, active)
+    for suffix, name, active in list_systemd_backup_units():
+        items.append(("systemd", name, active))
+    for name in list_screen_sessions():
+        items.append(("screen", name, True))
+    for name in list_tmux_sessions():
+        items.append(("tmux", name, True))
+
+    if not items:
+        print_warning("No scheduler instances found (systemd service / screen / tmux session).")
+        print_info("Create one from 'Auto Backup to Telegram Bot (Scheduled)' first.")
+        return
+
+    print(f"  {C.R2}Scheduler instances found:{C.RESET}\n")
+    for i, (kind, name, active) in enumerate(items, 1):
+        status = f"{C.R1}RUNNING{C.RESET}" if active else f"{C.R3}STOPPED{C.RESET}"
+        print(f"  {C.R1}{i}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}[{kind:<7}] {name}{C.RESET}   {status}")
+    print()
+
+    choice = input(f"  {C.R2}> Select a number to manage (ENTER to cancel): {C.RESET}").strip()
+    if not choice:
+        return
+    try:
+        idx = int(choice) - 1
+        if idx < 0:
+            raise ValueError
+        kind, name, active = items[idx]
+    except (ValueError, IndexError):
+        print_error("Invalid selection.")
+        return
+
+    print()
+    print(f"  {C.R1}1{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Restart{C.RESET}")
+    print(f"  {C.R1}2{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Stop{C.RESET}")
+    print(f"  {C.R1}3{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Remove completely{C.RESET}")
+    print(f"  {C.R1}4{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Cancel{C.RESET}")
+    print()
+    act = input(f"  {C.R2}> Choose action for '{name}' (1-4): {C.RESET}").strip()
+
+    if act == "1":
+        if kind == "systemd":
+            if _systemctl_action(name, "restart"):
+                print_success(f"'{name}' restarted.")
+            else:
+                print_error(f"Failed to restart '{name}'.")
+        else:
+            print_warning(f"{kind} sessions can't be restarted in place.")
+            print_info("Stop it and start a fresh scheduler instance instead.")
+
+    elif act == "2":
+        if kind == "systemd":
+            if _systemctl_action(name, "stop"):
+                print_success(f"'{name}' stopped (still installed — start it again anytime).")
+            else:
+                print_error(f"Failed to stop '{name}'.")
+        elif kind == "screen":
+            if run_command(f"screen -S {name} -X quit"):
+                print_success(f"Screen session '{name}' stopped.")
+            else:
+                print_error("Failed to stop the screen session.")
+        elif kind == "tmux":
+            if run_command(f"tmux kill-session -t {name}"):
+                print_success(f"Tmux session '{name}' stopped.")
+            else:
+                print_error("Failed to stop the tmux session.")
+
+    elif act == "3":
+        confirm = input(
+            f"  {C.R1}> This will permanently remove '{name}'. Confirm? (y/n): {C.RESET}"
+        ).strip().lower()
+        if confirm != "y":
+            print_warning("Aborted.")
+            return
+        if kind == "systemd":
+            _systemctl_action(name, "stop", quiet=True)
+            _systemctl_action(name, "disable", quiet=True)
+            unit_path = f"{SYSTEMD_UNIT_DIR}/{name}.service"
+            try:
+                if os.path.exists(unit_path):
+                    os.remove(unit_path)
+                run_command("systemctl daemon-reload", quiet=True)
+                print_success(f"Removed systemd scheduler '{name}'.")
+            except Exception as e:
+                print_error(f"Failed to remove unit file: {e}")
+        elif kind == "screen":
+            run_command(f"screen -S {name} -X quit", quiet=True)
+            print_success(f"Removed screen scheduler '{name}'.")
+        elif kind == "tmux":
+            run_command(f"tmux kill-session -t {name}", quiet=True)
+            print_success(f"Removed tmux scheduler '{name}'.")
+    else:
+        print_warning("Cancelled.")
+
 # ── Headless daemon entrypoint (used by screen / tmux / systemd) ──
 def run_daemon_from_args():
     parser = argparse.ArgumentParser(add_help=False)
@@ -1055,7 +1267,8 @@ MENU = [
     ("2", "Auto Backup to Telegram Bot (Scheduled)"),
     ("3", "Manual Backup (Save locally)"),
     ("4", "Manual Restore (From local zip)"),
-    ("5", "Exit"),
+    ("5", "Manage Backup Schedulers (start/stop/restart)"),
+    ("6", "Exit"),
 ]
 
 def main():
@@ -1064,14 +1277,14 @@ def main():
 
         print(f"  {C.R3}{'─' * 50}{C.RESET}")
         for num, label in MENU:
-            if num == "5":
+            if num == "6":
                 print(f"  {C.R3}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.R2}{label}{C.RESET}")
             else:
                 print(f"  {C.R1}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}{label}{C.RESET}")
         print(f"  {C.R3}{'─' * 50}{C.RESET}")
         print()
 
-        choice = input(f"  {C.R2}> Select option (1-5): {C.RESET}").strip()
+        choice = input(f"  {C.R2}> Select option (1-6): {C.RESET}").strip()
         print()
 
         if choice == "1":
@@ -1087,10 +1300,13 @@ def main():
             workflow_manual_restore()
             pause_and_return()
         elif choice == "5":
+            workflow_manage_schedulers()
+            pause_and_return()
+        elif choice == "6":
             print(f"  {C.R2}Goodbye.{C.RESET}\n")
             sys.exit(0)
         else:
-            print_error("Invalid option. Please enter 1-5.")
+            print_error("Invalid option. Please enter 1-6.")
             time.sleep(1.5)
 
 if __name__ == "__main__":
