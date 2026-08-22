@@ -234,6 +234,89 @@ def read_daemon_meta(instance):
         "node":     bool(data.get("node", False)),
     }
 
+def _migrate_legacy_systemd_instance(name):
+    """One-time upgrade path for a systemd scheduler that was created by a
+    pre-v4.2 version of this script, where --token/--chat/--interval/--node
+    were baked in plaintext inside ExecStart= (world-readable, and visible
+    in `ps`). Reads the old unit file, pulls the values back out, writes
+    them into the new 0600 credentials file, and rewrites ExecStart to the
+    new token-free form — so 'Restart' / 'Update Bot Token' work on it going
+    forward exactly like a scheduler created fresh in v4.2.
+
+    Returns the migrated meta dict on success, or None if the unit file
+    can't be found/parsed (e.g. it's already using the new format, or it's
+    not a scheduler this script created)."""
+    unit_path = f"{SYSTEMD_UNIT_DIR}/{name}.service"
+    if not os.path.exists(unit_path):
+        return None
+    try:
+        with open(unit_path) as f:
+            unit_text = f.read()
+    except Exception:
+        return None
+
+    exec_line = None
+    for line in unit_text.splitlines():
+        if line.strip().startswith("ExecStart="):
+            exec_line = line.strip()[len("ExecStart="):]
+            break
+    if not exec_line:
+        return None
+
+    try:
+        argv = shlex.split(exec_line)
+    except ValueError:
+        return None
+
+    token = chat = proxy = None
+    interval = 1.0
+    include_node = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--token" and i + 1 < len(argv):
+            token = argv[i + 1]; i += 2; continue
+        if a == "--chat" and i + 1 < len(argv):
+            chat = argv[i + 1]; i += 2; continue
+        if a == "--proxy" and i + 1 < len(argv):
+            proxy = argv[i + 1]; i += 2; continue
+        if a == "--interval" and i + 1 < len(argv):
+            try:
+                interval = float(argv[i + 1])
+            except ValueError:
+                pass
+            i += 2; continue
+        if a == "--node":
+            include_node = True; i += 1; continue
+        i += 1
+
+    if not token or not chat:
+        # Nothing usable to migrate (already new-format, or a foreign unit).
+        return None
+
+    print_info(f"Migrating '{name}' from the old plaintext-credentials format to the secure 0600 store...")
+    write_daemon_creds(name, token, chat, proxy, interval_h=interval, include_node=include_node)
+
+    # Rewrite ExecStart to the new token-free invocation and lock the unit
+    # file down, same as launch_via_systemd does for freshly created ones.
+    new_daemon_cmd = build_daemon_command(interval, include_node, instance=name)
+    new_unit_text = "\n".join(
+        (f"ExecStart={new_daemon_cmd}" if line.strip().startswith("ExecStart=") else line)
+        for line in unit_text.splitlines()
+    ) + "\n"
+    try:
+        with open(unit_path, "w") as f:
+            f.write(new_unit_text)
+        os.chmod(unit_path, 0o600)
+        run_command("systemctl daemon-reload", quiet=True)
+    except Exception as e:
+        print_warning(f"Credentials were migrated, but updating the unit file failed: {e}")
+        print_warning("The old token may still be readable in the unit file — consider removing")
+        print_warning("and recreating this scheduler instance instead.")
+
+    print_success(f"'{name}' migrated — credentials are now stored in {_creds_path(name)} (mode 600).")
+    return read_daemon_meta(name)
+
 # Per-instance status files so the "Manage Backup Schedulers" menu can show
 # whether an instance is currently backing up or sleeping until its next run,
 # instead of just a raw process-alive check.
@@ -2311,6 +2394,10 @@ def _restart_scheduler_instance(kind, name):
         return
 
     meta = read_daemon_meta(name)
+    if not meta and kind == "systemd":
+        # Older scheduler (pre-v4.2) — try to auto-migrate its credentials
+        # out of the plaintext unit file before giving up.
+        meta = _migrate_legacy_systemd_instance(name)
     if not meta:
         print_error(f"No stored credentials/config found for '{name}' — cannot rebuild it.")
         print_info("Remove it and create a fresh scheduler instance instead.")
@@ -2337,9 +2424,14 @@ def _update_scheduler_credentials(kind, name):
     0600 credentials file, then restarts the instance so the change takes
     effect immediately (same restart logic as option 1)."""
     meta = read_daemon_meta(name)
+    if not meta and kind == "systemd":
+        # Older scheduler (pre-v4.2) — try to auto-migrate its credentials
+        # out of the plaintext unit file before giving up.
+        meta = _migrate_legacy_systemd_instance(name)
     if not meta:
         print_error(f"No stored credentials found for '{name}' — cannot update it.")
-        print_info("This can happen for a scheduler created by an older script version.")
+        print_info("This can happen for a scheduler created by an older script version")
+        print_info("whose unit file could not be auto-migrated.")
         print_info("Remove it and create a fresh scheduler instance instead.")
         return
 
