@@ -4,18 +4,23 @@
 
 ### Professional Backup, Restore & Migration Utility for PasarGuard & PG-Node
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;PostgreSQL+%26+Docker+Automation" alt="Typing SVG" />
+<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;All+5+Backends+Auto--Detected;PostgreSQL+%26+Docker+Automation" alt="Typing SVG" />
 
-![Version](https://img.shields.io/badge/Version-v3.3-8B0000)
+![Version](https://img.shields.io/badge/Version-v4.1-8B0000)
 ![Python](https://img.shields.io/badge/Python-3.8+-8B0000)
 ![Platform](https://img.shields.io/badge/Platform-Linux-8B0000)
 ![Docker](https://img.shields.io/badge/Docker-Supported-8B0000)
+![SQLite](https://img.shields.io/badge/SQLite-Supported-8B0000)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supported-8B0000)
+![TimescaleDB](https://img.shields.io/badge/TimescaleDB-Supported-8B0000)
+![MySQL](https://img.shields.io/badge/MySQL-Supported-8B0000)
+![MariaDB](https://img.shields.io/badge/MariaDB-Supported-8B0000)
+![Multi-DB](https://img.shields.io/badge/Multi--Database-Auto--Detected-8B0000)
 ![Telegram](https://img.shields.io/badge/Telegram-Automation-8B0000)
 ![SSH](https://img.shields.io/badge/SSH-Migration-8B0000)
 ![License](https://img.shields.io/badge/License-MIT-8B0000)
 
-Backup • Restore • Migration • Telegram Automation • PostgreSQL • Docker
+Backup • Restore • Migration • Telegram Automation • All 5 Backends • Docker
 
 </div>
 
@@ -29,6 +34,8 @@ Backup • Restore • Migration • Telegram Automation • PostgreSQL • Dock
 
 این ابزار با هدف ساده‌سازی مدیریت زیرساخت طراحی شده و امکان انتقال کامل سرویس‌ها بین سرورها، ارسال خودکار بکاپ به تلگرام و بازیابی سریع اطلاعات را فراهم می‌کند.
 
+> 🆕 **v4.1** — تشخیص خودکار **تمام ۵ بک‌اند رسمی پاسارگارد** (SQLite، PostgreSQL، TimescaleDB، MySQL، MariaDB) از روی `SQLALCHEMY_DATABASE_URL` در `.env` و اسکن `docker-compose.yml`. همچنین پشتیبانی کامل از **تمام دیتابیس‌های پاسارگارد** (نه فقط دیتابیس پیش‌فرض).
+
 ---
 
 # ✨ قابلیت‌ها
@@ -39,10 +46,45 @@ Backup • Restore • Migration • Telegram Automation • PostgreSQL • Dock
 * 🚀 انتقال مستقیم به سرور جدید
 * 🤖 ارسال خودکار بکاپ به تلگرام
 * ⏰ بکاپ زمان‌بندی‌شده
-* 🗄️ بکاپ و ریستور PostgreSQL
+* 🗄️ بکاپ و ریستور **همه‌ی دیتابیس‌های پاسارگارد** (Multi-Database)
 * 🐳 مدیریت خودکار Docker Stack
 * ⚙️ نصب خودکار وابستگی‌ها
 * 🔐 انتقال امن از طریق SSH
+* 🎯 **تشخیص خودکار بک‌اند** دیتابیس (هیچ سؤالی از کاربر پرسیده نمی‌شود)
+
+---
+
+# 🗄️ بک‌اندهای دیتابیس پشتیبانی‌شده (v4.1)
+
+ابزار به‌صورت **خودکار** نوع دیتابیس را از فایل `/opt/pasarguard/.env` و `docker-compose.yml` تشخیص می‌دهد — بدون هیچ سؤال یا تنظیم اضافی:
+
+| بک‌اند | ابزار بکاپ | ابزار ریستور |
+| --- | --- | --- |
+| **SQLite** | کپی فایل `db.sqlite3` | کپی فایل (با توقف موقت پنل) |
+| **PostgreSQL** | `pg_dump` + `pg_dumpall` (همه‌ی دیتابیس‌ها) | `psql` (per-database) |
+| **TimescaleDB** | `pg_dump` + `pg_dumpall` (با ثبت نسخه‌ی extension) | `psql` (per-database) |
+| **MySQL** | `mysqldump` | `mysql` (با fallback خودکار credential) |
+| **MariaDB** | `mysqldump` | `mysql` (با fallback خودکار credential) |
+
+### فرآیند تشخیص (اتوماتیک)
+
+```text
+خواندن /opt/pasarguard/.env
+     │
+     ▼
+پارس SQLALCHEMY_DATABASE_URL
+     │
+     ▼
+اسکن docker-compose.yml
+(تشخیص timescaledb از postgres
+ و mariadb از mysql با دیدن image)
+     │
+     ▼
+انتخاب ابزار و کانتینر مناسب
+     │
+     ▼
+بکاپ / ریستور خودکار
+```
 
 ---
 
@@ -86,6 +128,8 @@ PG-Backup
 7 ─ 🚪 Exit
 ```
 
+> 🆕 **v4.1**: تمام workflowهای بکاپ (۱، ۲، ۳) **تمام دیتابیس‌های پاسارگارد** را بکاپ می‌گیرند و تمام workflowهای ریستور (۱، ۴) **خودکار** بک‌اند مقصد را از روی `.env` استخراج‌شده تشخیص می‌دهند.
+
 ---
 
 # 📦 حالت‌های بکاپ
@@ -95,7 +139,11 @@ PG-Backup
 ```text
 /opt/pasarguard
 /var/lib/pasarguard
-PostgreSQL Database
+All Pasarguard Databases (Multi-DB)
+  ├── globals.sql  (PG/TS only)
+  ├── db-001.sql
+  ├── db-002.sql
+  └── manifest.tsv
 ```
 
 ---
@@ -105,7 +153,7 @@ PostgreSQL Database
 ```text
 /opt/pasarguard
 /var/lib/pasarguard
-PostgreSQL Database
+All Pasarguard Databases (Multi-DB)
 
 /opt/pg-node
 /var/lib/pg-node
@@ -120,7 +168,10 @@ PostgreSQL Database
 ### فرآیند انتقال
 
 ```text
-Create Backup
+Detect Backend Auto
+     │
+     ▼
+Create Multi-DB Backup
      │
      ▼
 Send To Telegram (Optional)
@@ -132,7 +183,10 @@ Connect To New Server
 Upload Backup
      │
      ▼
-Restore Data
+Detect Target Backend Auto
+     │
+     ▼
+Restore Data (Per-Backend)
      │
      ▼
 Start Services
@@ -218,7 +272,7 @@ backup_full_20260801120000.zip
 
 * فایل‌های برنامه
 * تنظیمات
-* دیتابیس PostgreSQL
+* **تمام دیتابیس‌های پاسارگارد** (نه فقط یکی)
 * داده‌های PG-Node
 * داده‌های PasarGuard
 
@@ -227,7 +281,8 @@ backup_full_20260801120000.zip
 ```text
 Stop Containers
 Restore Files
-Restore Database
+Detect Backend From .env
+Restore Databases (Per-Backend)
 Start Containers
 Health Check
 ```
@@ -242,10 +297,16 @@ backup_full_YYYYMMDDHHMMSS.zip
 ├── docker-compose.yml
 ├── .env
 │
-├── pg_dump
-│   ├── globals.sql
-│   ├── db-001.sql
+├── db_dump
+│   ├── globals.sql          (فقط برای PostgreSQL / TimescaleDB)
+│   ├── db-001.sql           (یا db.sqlite3 برای SQLite)
+│   ├── db-002.sql           (PG/TS multi-DB)
+│   ├── db-003.sql           (PG/TS multi-DB)
 │   └── manifest.tsv
+│       # pg_backup_manifest  v4.1  format=tsv  db_type=timescaledb
+│       pasarguard  pasarguard  1  db-001.sql  2.17.2
+│       analytics   pasarguard  0  db-002.sql
+│       node_panel  pasarguard  0  db-003.sql
 │
 ├── pasarguard_data
 │
@@ -284,6 +345,7 @@ sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/
 * اطلاعات ورود SSH ذخیره نمی‌شوند.
 * فایل‌های بکاپ شامل اطلاعات حساس هستند.
 * توصیه می‌شود نسخه‌های پشتیبان در محل امن نگهداری شوند.
+* **رمزهای عبور (DB_PASSWORD و غیره) در خروجی ابزار به‌صورت `****XXXX` نمایش داده می‌شوند.**
 
 ---
 
