@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v3.3
+#   Pasarguard Backup Utility  v4.1
 #   Dev by: CIA
 #   GitHub: https://github.com/CIAUB
+#   v4.0 — multi-database support: backs up & restores EVERY Pasarguard DB
+#          (not just the legacy "pasarguard" database).
+#   v4.1 — full compatibility with the official PasarGuard panel
+#          (https://github.com/PasarGuard/panel): detects and handles all
+#          five supported backends — sqlite, postgresql, timescaledb, mysql,
+#          mariadb — including single-file sqlite backups, mysqldump for
+#          MySQL/MariaDB, and per-database pg_dump for PostgreSQL/TimescaleDB.
 # ============================================================
 
 import os, sys, subprocess, datetime, shutil
@@ -177,7 +184,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 3 . 3   -   C I A U B" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 1   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
@@ -521,6 +528,339 @@ def db_service_local(d=None):
 def db_service_ssh(ssh, d=None):
     return _detect_db_service_ssh(ssh, d)
 
+# ── Multi-database discovery (v4.0) ───────────────────────────
+# PasarGuard may use several PostgreSQL databases (the legacy "pasarguard"
+# plus any extra ones added by nodes / add-ons).  The old v3.x code only
+# backed up the single "pasarguard" database; this version discovers EVERY
+# non-template, non-system database on the server and dumps them all into
+# the archive, with a manifest that tells the restore side what to do.
+_SYSTEM_DBS = ("postgres", "template0", "template1")
+
+def _list_databases_local(svc):
+    """Return a sorted list of all non-template, non-system database names
+    on the local Pasarguard Postgres instance. Falls back to ['pasarguard']
+    if the query fails (so single-DB legacy installs still work)."""
+    query = ("SELECT datname FROM pg_database "
+             "WHERE datistemplate=false AND datname NOT IN "
+             "('postgres','template0','template1') ORDER BY datname;")
+    ok_v, out, _ = local_shell(
+        f"docker compose exec -T {svc} psql -U pasarguard -d postgres -tA -c {shlex.quote(query)}",
+        cwd=PASARGUARD_DIR,
+    )
+    if not ok_v or not out:
+        print_warning("Could not enumerate Pasarguard databases — falling back to legacy 'pasarguard' only.")
+        return ["pasarguard"]
+    names = [l.strip() for l in out.splitlines() if l.strip()]
+    if not names:
+        print_warning("No user databases found — falling back to legacy 'pasarguard' only.")
+        return ["pasarguard"]
+    return names
+
+def _list_databases_ssh(ssh, svc):
+    """Same as _list_databases_local, but against the remote (target) host."""
+    query = ("SELECT datname FROM pg_database "
+             "WHERE datistemplate=false AND datname NOT IN "
+             "('postgres','template0','template1') ORDER BY datname;")
+    ec, out, _ = ssh_shell(
+        ssh,
+        f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres -tA -c {shlex.quote(query)}",
+    )
+    if ec != 0 or not out:
+        print_warning("Could not enumerate Pasarguard databases on remote host — falling back to legacy 'pasarguard' only.")
+        return ["pasarguard"]
+    names = [l.strip() for l in out.splitlines() if l.strip()]
+    if not names:
+        print_warning("No user databases found on remote host — falling back to legacy 'pasarguard' only.")
+        return ["pasarguard"]
+    return names
+
+def _ident(name):
+    """Safely quote a PostgreSQL identifier for embedding in a SQL string.
+    Doubles any embedded double-quotes, then wraps in double-quotes."""
+    return '"' + name.replace('"', '""') + '"'
+
+# ── PasarGuard backend detection (v4.1) ──────────────────────
+# The official panel (https://github.com/PasarGuard/panel) supports five
+# database backends: sqlite, postgresql, timescaledb, mysql, mariadb.
+# We detect which one is in use by reading SQLALCHEMY_DATABASE_URL from
+# /opt/pasarguard/.env, and we use the docker-compose image name to
+# differentiate timescaledb from plain postgresql and mariadb from mysql.
+SUPPORTED_BACKENDS = ("sqlite", "postgresql", "timescaledb", "mysql", "mariadb")
+
+def _read_env_file(path):
+    """Read a dotenv-style file and return {KEY: raw_value}. Values are
+    returned verbatim (no shell-expansion, no type coercion) so secrets stay
+    intact. Lines starting with '#', blank lines, and inline comments after
+    a value are skipped."""
+    out = {}
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                # Strip surrounding quotes
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                    v = v[1:-1]
+                out[k] = v
+    except FileNotFoundError:
+        pass
+    return out
+
+def _mask_secret(value):
+    """Show only the last 4 characters of a secret for display purposes."""
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "****"
+    return f"****{value[-4:]}"
+
+def _parse_sqlalchemy_url(url):
+    """Return (scheme, user, password, host, port, dbname) for a
+    SQLAlchemy URL like:
+        postgresql+asyncpg://user:pass@host:5432/dbname
+        mysql+asyncmy://user:pass@host:3306/dbname
+        sqlite+aiosqlite:///var/lib/pasarguard/db.sqlite3
+    Returns (None,...) if the URL is unparseable."""
+    if not url:
+        return (None, None, None, None, None, None)
+    # Strip SQLAlchemy driver suffix (+asyncpg, +asyncmy, +aiosqlite, +pymysql, ...)
+    try:
+        scheme_full, rest = url.split("://", 1)
+    except ValueError:
+        return (None, None, None, None, None, None)
+    scheme = scheme_full.split("+", 1)[0].lower()
+
+    # SQLite is special — no host/port/user, just a path.
+    if scheme == "sqlite":
+        # SQLAlchemy uses one extra leading '/' to mark absolute paths:
+        #   sqlite:///relative.db     -> "relative.db"
+        #   sqlite:////absolute/x.db  -> "/absolute/x.db"
+        # So strip at most one leading '/' to preserve the absolute-path '/'.
+        if rest.startswith("//"):
+            rest = rest[1:]  # leave one '/' for absolute paths
+        elif rest.startswith("/"):
+            pass  # already a single '/' — keep as-is
+        return (scheme, None, None, None, None, rest)
+
+    # user[:password]@host[:port]/dbname
+    user = password = host = port = dbname = None
+    if "@" in rest:
+        creds, rest = rest.split("@", 1)
+        if ":" in creds:
+            user, password = creds.split(":", 1)
+        else:
+            user = creds
+    # Strip query string
+    if "?" in rest:
+        rest = rest.split("?", 1)[0]
+    if "/" in rest:
+        host_port, dbname = rest.split("/", 1)
+    else:
+        host_port, dbname = rest, ""
+    if ":" in host_port:
+        host, port_s = host_port.split(":", 1)
+        try:
+            port = int(port_s)
+        except ValueError:
+            port = None
+    else:
+        host = host_port
+        port = None
+    return (scheme, user, password, host, port, dbname)
+
+def _compose_image_contains(svc_image, needle):
+    """True if the compose service's image string contains `needle`
+    (case-insensitive substring match)."""
+    if not svc_image:
+        return False
+    return needle.lower() in svc_image.lower()
+
+def _list_compose_services_local(d=None):
+    """Return [(service_name, image_string), ...] from docker compose config.
+    Best-effort: uses `docker compose config` if available, otherwise parses
+    docker-compose.yml as text."""
+    d = d or PASARGUARD_DIR
+    ok_v, out, _ = local_shell("docker compose config 2>/dev/null", cwd=d)
+    if not ok_v or not out:
+        # Fall back to a text parse of docker-compose.yml
+        try:
+            with open(os.path.join(d, "docker-compose.yml")) as f:
+                out = f.read()
+        except FileNotFoundError:
+            return []
+    services = []
+    current = None
+    img = None
+    for line in out.splitlines():
+        stripped = line.rstrip()
+        # Lines like "  timescaledb:" start a service; "  image: ..." gives its image
+        if not stripped.startswith(" ") and stripped.endswith(":") and not stripped.startswith("#"):
+            if current and img:
+                services.append((current, img))
+            current = stripped[:-1].strip()
+            img = None
+            continue
+        s = stripped.strip()
+        if s.startswith("image:"):
+            img = s.split(":", 1)[1].strip().strip('"').strip("'")
+    if current and img:
+        services.append((current, img))
+    return services
+
+def _list_compose_services_ssh(ssh, d=None):
+    """Same as _list_compose_services_local but over SSH."""
+    d = d or PASARGUARD_DIR
+    ec, out, _ = ssh_shell(ssh, f"cd {d} && docker compose config 2>/dev/null")
+    if ec != 0 or not out:
+        ec2, out2, _ = ssh_shell(ssh, f"cat {d}/docker-compose.yml 2>/dev/null")
+        if ec2 != 0:
+            return []
+        out = out2
+    services = []
+    current = None
+    img = None
+    for line in out.splitlines():
+        stripped = line.rstrip()
+        if not stripped.startswith(" ") and stripped.endswith(":") and not stripped.startswith("#"):
+            if current and img:
+                services.append((current, img))
+            current = stripped[:-1].strip()
+            img = None
+            continue
+        s = stripped.strip()
+        if s.startswith("image:"):
+            img = s.split(":", 1)[1].strip().strip('"').strip("'")
+    if current and img:
+        services.append((current, img))
+    return services
+
+def _detect_backend_local():
+    """Read /opt/pasarguard/.env, parse SQLALCHEMY_DATABASE_URL, scan
+    docker-compose.yml for the DB image, and return a backend dict with
+    keys: type, host, port, user, password, dbname, container, env, services."""
+    env = _read_env_file(os.path.join(PASARGUARD_DIR, ".env"))
+    url = env.get("SQLALCHEMY_DATABASE_URL", "")
+    scheme, user, pwd, host, port, dbname = _parse_sqlalchemy_url(url)
+    services = _list_compose_services_local()
+    return _resolve_backend(scheme, user, pwd, host, port, dbname, env, services)
+
+def _detect_backend_ssh(ssh):
+    """Same as _detect_backend_local but reads the .env and compose file
+    on the remote host."""
+    ec, env_text, _ = ssh_shell(ssh, f"cat {PASARGUARD_DIR}/.env 2>/dev/null")
+    env = {}
+    if ec == 0 and env_text:
+        # Parse the remote .env inline (don't write to a local temp file)
+        for raw in env_text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1]
+            env[k] = v
+    url = env.get("SQLALCHEMY_DATABASE_URL", "")
+    scheme, user, pwd, host, port, dbname = _parse_sqlalchemy_url(url)
+    services = _list_compose_services_ssh(ssh)
+    return _resolve_backend(scheme, user, pwd, host, port, dbname, env, services)
+
+def _resolve_backend(scheme, user, pwd, host, port, dbname, env, services):
+    """Build the final backend config from already-parsed URL parts,
+    the env-var map, and the list of (service_name, image) tuples.
+    Falls back to legacy Postgres defaults if anything is missing."""
+    db_type = None
+    container = None
+
+    if scheme == "sqlite":
+        db_type = "sqlite"
+        container = None  # no DB container for SQLite
+    elif scheme == "postgresql":
+        # Differentiate timescaledb from plain postgres by the compose image.
+        is_ts = any(_compose_image_contains(img, "timescale") for _, img in services)
+        db_type = "timescaledb" if is_ts else "postgresql"
+        container = _pick_service_by_image(services,
+            image_needles=("timescaledb", "timescale", "postgres", "postgresql", "pgsql"),
+            name_needles=("timescaledb", "postgresql", "postgres", "pgsql", "db", "database"),
+        )
+    elif scheme in ("mysql", "mariadb"):
+        is_mariadb = any(_compose_image_contains(img, "mariadb") for _, img in services)
+        db_type = "mariadb" if is_mariadb else "mysql"
+        container = _pick_service_by_image(services,
+            image_needles=("mariadb", "mysql"),
+            name_needles=("mariadb", "mysql", "db", "database"),
+        )
+    else:
+        # Unknown scheme — fall back to legacy v3.x defaults (pasarguard+postgres)
+        db_type = "postgresql"
+        container = _pick_service_by_image(services,
+            image_needles=("timescaledb", "postgres", "postgresql", "pgsql"),
+            name_needles=("timescaledb", "postgres", "postgresql", "pgsql", "db", "database"),
+        )
+
+    # Backfill missing creds from the .env DB_* keys
+    if not user:   user   = env.get("DB_USER", "")
+    if not pwd:    pwd    = env.get("DB_PASSWORD", "")
+    if not dbname: dbname = env.get("DB_NAME", "pasarguard")
+    if not host:   host   = "127.0.0.1"
+    if not port:
+        if db_type in ("postgresql", "timescaledb"):
+            port = 5432
+        elif db_type in ("mysql", "mariadb"):
+            port = 3306
+        else:
+            port = 0
+
+    # For SQLite, the on-disk path is in the URL after the scheme
+    sqlite_path = None
+    if db_type == "sqlite" and dbname:
+        sqlite_path = "/" + dbname  # dbname was the rest of the URL
+
+    return {
+        "type":       db_type,
+        "host":       host,
+        "port":       port,
+        "user":       user or "",
+        "password":   pwd or "",
+        "dbname":     dbname or "",
+        "container":  container,
+        "env":        env,
+        "services":   services,
+        "sqlite_path": sqlite_path,
+    }
+
+def _pick_service_by_image(services, image_needles=(), name_needles=()):
+    """Pick the most likely DB service from a list of (name, image) tuples.
+    Prefers exact image matches, then name-substring matches, then any service
+    that looks like a database. Returns the service name or None."""
+    if not services:
+        return None
+    if len(services) == 1:
+        return services[0][0]
+    # 1. Exact image match
+    for needle in image_needles:
+        for name, img in services:
+            if img.lower() == needle.lower():
+                return name
+    # 2. Substring image match
+    for needle in image_needles:
+        for name, img in services:
+            if needle.lower() in img.lower():
+                return name
+    # 3. Substring service-name match
+    for needle in name_needles:
+        for name, _ in services:
+            if needle.lower() in name.lower():
+                return name
+    return services[0][0]
+
 # ── Docker compose helpers ────────────────────────────────────
 def _running_ids_local(d):
     _, out, _ = local_shell("docker compose ps -q --status running", cwd=d)
@@ -811,6 +1151,24 @@ def create_backup(include_node=True):
     scope_label = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
     print_info(f"Starting backup  scope: {C.BOLD}{scope_label}{C.RESET}")
 
+    # v4.1 — detect the actual database backend (sqlite / postgresql /
+    # timescaledb / mysql / mariadb) before doing anything else.
+    try:
+        backend = _detect_backend_local()
+    except Exception as e:
+        print_warning(f"Backend auto-detection failed: {e} — assuming legacy postgres+pasarguard")
+        backend = {
+            "type": "postgresql", "host": "127.0.0.1", "port": 5432,
+            "user": "pasarguard", "password": "", "dbname": "pasarguard",
+            "container": None, "env": {}, "services": [], "sqlite_path": None,
+        }
+    print_info(
+        f"Detected backend: {C.BOLD}{backend['type']}{C.RESET}  "
+        f"db={backend['dbname']}  user={backend['user']}  "
+        f"host={backend['host']}:{backend['port']}  "
+        f"container={backend['container'] or '(none — sqlite)'}"
+    )
+
     ts          = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     scope_tag   = "full" if include_node else "pg"
     backup_name = f"backup_{scope_tag}_{ts}"
@@ -818,13 +1176,13 @@ def create_backup(include_node=True):
     final_base  = os.path.join(os.getcwd(), backup_name)
     zip_path    = f"{final_base}.zip"
 
-    pg_dump_dir    = os.path.join(tmp_dir, "pg_dump")
-    pg_data_dest   = os.path.join(tmp_dir, "pasarguard_data")
-    node_opt_dest  = os.path.join(tmp_dir, "pg_node_opt")
-    node_data_dest = os.path.join(tmp_dir, "pg_node_data")
+    db_dir        = os.path.join(tmp_dir, "db_dump")
+    pg_data_dest  = os.path.join(tmp_dir, "pasarguard_data")
+    node_opt_dest = os.path.join(tmp_dir, "pg_node_opt")
+    node_data_dest= os.path.join(tmp_dir, "pg_node_data")
 
     try:
-        os.makedirs(pg_dump_dir, exist_ok=True)
+        os.makedirs(db_dir, exist_ok=True)
 
         print_info("Copying PasarGuard config files...")
         for fn in ("docker-compose.yml", ".env"):
@@ -832,18 +1190,11 @@ def create_backup(include_node=True):
             if os.path.exists(src):
                 shutil.copy(src, tmp_dir)
 
-        svc = db_service_local()
-        print_info("Exporting PostgreSQL globals...")
-        run_command(f"docker compose exec -T {svc} pg_dumpall -U pasarguard --globals-only",
-                    output_file=os.path.join(pg_dump_dir, "globals.sql"), cwd=PASARGUARD_DIR)
-
-        print_info("Exporting PasarGuard database... (may take a while)")
-        run_command(f"docker compose exec -T {svc} pg_dump -U pasarguard -d pasarguard",
-                    output_file=os.path.join(pg_dump_dir, "db-001.sql"), cwd=PASARGUARD_DIR)
-
-        print_info("Writing manifest...")
-        with open(os.path.join(pg_dump_dir, "manifest.tsv"), "w") as f:
-            f.write("pasarguard\tpasarguard\t1\tdb-001.sql\t2.28.1\n")
+        # Backup the actual database, dispatching on the backend type.
+        if not _backup_database_local(backend, db_dir):
+            print_error("Database backup failed. Aborting.")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
 
         if os.path.exists(PASARGUARD_DATA_DIR):
             print_info("Copying PasarGuard data directory...")
@@ -874,7 +1225,398 @@ def create_backup(include_node=True):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
+# ── Per-backend local backup dispatchers ──────────────────────
+def _backup_database_local(backend, db_dir):
+    """Dump the live PasarGuard database into `db_dir` and write a manifest.
+    Returns True on success, False on any error."""
+    t = backend["type"]
+    if t in ("postgresql", "timescaledb"):
+        return _backup_postgres_local(backend, db_dir)
+    if t in ("mysql", "mariadb"):
+        return _backup_mysql_local(backend, db_dir)
+    if t == "sqlite":
+        return _backup_sqlite_local(backend, db_dir)
+    print_error(f"Unsupported backend type: '{t}'")
+    return False
+
+def _backup_postgres_local(backend, db_dir):
+    """Dump every user database on a PostgreSQL or TimescaleDB instance."""
+    svc = backend.get("container") or "postgres"
+    user = backend["user"] or "pasarguard"
+
+    # globals.sql — roles, tablespaces, shared grants
+    print_info("Exporting PostgreSQL globals (pg_dumpall)...")
+    run_command(
+        f"docker compose exec -T {svc} pg_dumpall -U {shlex.quote(user)} --globals-only",
+        output_file=os.path.join(db_dir, "globals.sql"),
+        cwd=PASARGUARD_DIR,
+    )
+
+    databases = _list_databases_local(svc)
+    print_info(f"Found {len(databases)} Pasarguard database(s): {', '.join(databases)}")
+
+    manifest_path = os.path.join(db_dir, "manifest.tsv")
+    with open(manifest_path, "w") as mf:
+        mf.write(f"# pg_backup_manifest\tv4.1\tformat=tsv\tdb_type={backend['type']}\n")
+        for idx, db in enumerate(databases, 1):
+            sql_file = f"db-{idx:03d}.sql"
+            has_ts, ts_ver = _pg_db_timescale_info(svc, user, db)
+            print_info(f"Exporting database {C.BOLD}{db}{C.RESET} → {sql_file}  (may take a while)")
+            run_command(
+                f"docker compose exec -T {svc} pg_dump -U {shlex.quote(user)} "
+                f"--clean --if-exists -d {shlex.quote(db)}",
+                output_file=os.path.join(db_dir, sql_file),
+                cwd=PASARGUARD_DIR,
+            )
+            mf.write(f"{db}\t{user}\t{1 if has_ts else 0}\t{sql_file}\t{ts_ver}\n")
+
+    print_success(f"Wrote manifest with {len(databases)} database entr{'y' if len(databases)==1 else 'ies'}.")
+    return True
+
+def _pg_db_timescale_info(svc, user, dbname):
+    """Return (has_timescaledb_ext: bool, ext_version: str) for a database.
+    Returns (False, "") if the query fails or the extension isn't installed."""
+    query = "SELECT extversion FROM pg_extension WHERE extname='timescaledb' LIMIT 1;"
+    ok_v, out, _ = local_shell(
+        f"docker compose exec -T {svc} psql -U {shlex.quote(user)} -d {shlex.quote(dbname)} "
+        f"-tA -c {shlex.quote(query)}",
+        cwd=PASARGUARD_DIR,
+    )
+    if not ok_v:
+        return False, ""
+    version = out.strip().splitlines()
+    if version and version[0]:
+        return True, version[0]
+    return False, ""
+
+def _backup_mysql_local(backend, db_dir):
+    """Dump a single MySQL/MariaDB database (the official panel only uses
+    one DB per install)."""
+    svc    = backend.get("container")
+    user   = backend["user"] or "root"
+    pwd    = backend["password"]
+    dbname = backend["dbname"] or "pasarguard"
+
+    if not svc:
+        print_error("Could not identify the MySQL/MariaDB container — aborting.")
+        return False
+
+    env = f"MYSQL_PWD={shlex.quote(pwd)}" if pwd else ""
+    sql_file = "db-001.sql"
+    out_path = os.path.join(db_dir, sql_file)
+    print_info(f"Exporting {backend['type']} database {C.BOLD}{dbname}{C.RESET} → {sql_file}  (may take a while)")
+    ok = run_command(
+        f"{env} docker compose exec -T {svc} mysqldump "
+        f"-u {shlex.quote(user)} --single-transaction --quick --triggers --events --routines "
+        f"--hex-blob --default-character-set=utf8mb4 {shlex.quote(dbname)}",
+        output_file=out_path,
+        cwd=PASARGUARD_DIR,
+    )
+    if not ok:
+        return False
+
+    manifest_path = os.path.join(db_dir, "manifest.tsv")
+    with open(manifest_path, "w") as mf:
+        mf.write(f"# pg_backup_manifest\tv4.1\tformat=tsv\tdb_type={backend['type']}\n")
+        mf.write(f"{dbname}\t{user}\t0\t{sql_file}\t\n")
+    print_success(f"Wrote manifest for {backend['type']} database '{dbname}'.")
+    return True
+
+def _backup_sqlite_local(backend, db_dir):
+    """Copy the SQLite database file from /var/lib/pasarguard/ into db_dir.
+    The official panel uses one file, conventionally db.sqlite3."""
+    candidates = []
+    if backend.get("sqlite_path"):
+        candidates.append(backend["sqlite_path"])
+    # Common defaults
+    candidates += [
+        os.path.join(PASARGUARD_DATA_DIR, "db.sqlite3"),
+        os.path.join(PASARGUARD_DATA_DIR, "db.sqlite"),
+    ]
+    src = next((c for c in candidates if os.path.exists(c)), None)
+    if not src:
+        print_error(f"No SQLite database file found (tried: {', '.join(candidates)})")
+        return False
+
+    dst_name = os.path.basename(src)
+    print_info(f"Copying SQLite database {src} → db_dump/{dst_name}")
+    shutil.copy2(src, os.path.join(db_dir, dst_name))
+
+    manifest_path = os.path.join(db_dir, "manifest.tsv")
+    with open(manifest_path, "w") as mf:
+        mf.write("# pg_backup_manifest\tv4.1\tformat=tsv\tdb_type=sqlite\n")
+        mf.write(f"{os.path.splitext(dst_name)[0]}\tpasarguard\t0\t{dst_name}\t\n")
+    print_success("Wrote manifest for SQLite database.")
+    return True
+
 # ── Workflow 1: Transfer to new server ───────────────────────
+def _read_manifest(db_dir):
+    """Read the manifest.tsv and return (db_type, entries).
+    `entries` is a list of (db, sql_file, has_ts, ts_version) tuples.
+    Tolerates the v4.1 header format, the v4.0 header format, and the
+    legacy v3.3 single-row format (no header)."""
+    manifest_path = os.path.join(db_dir, "manifest.tsv")
+    if not os.path.exists(manifest_path):
+        return None, []
+    db_type = None
+    entries = []
+    with open(manifest_path) as f:
+        for raw in f:
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                # v4.1 header line: # pg_backup_manifest\tv4.1\tformat=tsv\tdb_type=postgresql
+                if "db_type=" in line:
+                    for part in line.split():
+                        if part.startswith("db_type="):
+                            db_type = part.split("=", 1)[1]
+                continue
+            cols = line.split("\t")
+            if len(cols) < 4:
+                continue
+            db       = cols[0]
+            sql_file = cols[3]
+            has_ts   = cols[2] == "1" if len(cols) > 2 else False
+            ts_ver   = cols[4] if len(cols) > 4 else ""
+            if db and sql_file:
+                entries.append((db, sql_file, has_ts, ts_ver))
+    if not db_type:
+        # Heuristic: if entries mention .sqlite → sqlite; if globals.sql present → postgres/timescaledb
+        if any(f.endswith(".sqlite3") or f.endswith(".sqlite") or f == "db_backup.sqlite" for _, f, _, _ in entries):
+            db_type = "sqlite"
+        elif os.path.exists(os.path.join(db_dir, "globals.sql")):
+            db_type = "postgresql"
+        elif any(f.endswith(".sql") for _, f, _, _ in entries):
+            db_type = "mysql"
+    return db_type, entries
+
+# ── Per-backend restore dispatchers ──────────────────────────
+def _restore_databases_remote(ssh, db_dir, remote_db_svc, backend_type=None):
+    db_type, entries = _read_manifest(db_dir)
+    if not entries:
+        print_error("manifest.tsv not found or empty — cannot restore databases.")
+        return False
+    effective_type = backend_type or db_type or "postgresql"
+    print_info(f"Manifest declares backend: {effective_type}  ({len(entries)} database entr{'y' if len(entries)==1 else 'ies'})")
+
+    if effective_type in ("postgresql", "timescaledb"):
+        return _restore_postgres_remote(ssh, db_dir, remote_db_svc, entries)
+    if effective_type in ("mysql", "mariadb"):
+        return _restore_mysql_remote(ssh, db_dir, remote_db_svc, entries)
+    if effective_type == "sqlite":
+        return _restore_sqlite_remote(ssh, db_dir, entries)
+    print_error(f"Unsupported backend in manifest: '{effective_type}'")
+    return False
+
+def _restore_databases_local(db_dir, local_db_svc, backend_type=None):
+    db_type, entries = _read_manifest(db_dir)
+    if not entries:
+        print_error("manifest.tsv not found or empty — cannot restore databases.")
+        return False
+    effective_type = backend_type or db_type or "postgresql"
+    print_info(f"Manifest declares backend: {effective_type}  ({len(entries)} database entr{'y' if len(entries)==1 else 'ies'})")
+
+    if effective_type in ("postgresql", "timescaledb"):
+        return _restore_postgres_local(db_dir, local_db_svc, entries)
+    if effective_type in ("mysql", "mariadb"):
+        return _restore_mysql_local(db_dir, local_db_svc, entries)
+    if effective_type == "sqlite":
+        return _restore_sqlite_local(db_dir, entries)
+    print_error(f"Unsupported backend in manifest: '{effective_type}'")
+    return False
+
+# ── PostgreSQL / TimescaleDB remote restore ───────────────────
+def _restore_postgres_remote(ssh, db_dir, svc, entries):
+    # Restore globals once
+    print_info("Restoring globals.sql (roles / tablespaces / shared grants)...")
+    if not execute_ssh_command(
+        ssh,
+        f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/globals.sql | "
+        f"docker compose exec -T {svc} psql -U pasarguard -d postgres",
+        "Restoring globals.sql",
+        required=True,
+    ):
+        return False
+
+    for db, sql_file, _has_ts, _ts_ver in entries:
+        ident = _ident(db)
+        print_info(f"Recreating database {C.BOLD}{db}{C.RESET}...")
+        execute_ssh_command(
+            ssh,
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"-c {shlex.quote(f'DROP DATABASE IF EXISTS {ident} WITH (FORCE);')}",
+            f"Dropping old database '{db}'",
+            required=False,
+        )
+        if not execute_ssh_command(
+            ssh,
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"-c {shlex.quote(f'CREATE DATABASE {ident};')}",
+            f"Creating database '{db}'",
+            required=True,
+        ):
+            return False
+        print_info(f"Restoring {sql_file} → {db}  (may take a while)...")
+        if not execute_ssh_command(
+            ssh,
+            f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
+            f"docker compose exec -T {svc} psql -U pasarguard -d {shlex.quote(db)}",
+            f"Restoring {sql_file}",
+            required=True,
+        ):
+            return False
+    return True
+
+# ── PostgreSQL / TimescaleDB local restore ────────────────────
+def _restore_postgres_local(db_dir, svc, entries):
+    print_info("Restoring globals.sql (roles / tablespaces / shared grants)...")
+    if not run_command(
+        f"cd {PASARGUARD_DIR} && cat {db_dir}/globals.sql | "
+        f"docker compose exec -T {svc} psql -U pasarguard -d postgres"
+    ):
+        print_error("Failed to restore globals.sql")
+        return False
+
+    for db, sql_file, _has_ts, _ts_ver in entries:
+        ident = _ident(db)
+        print_info(f"Recreating database {C.BOLD}{db}{C.RESET}...")
+        run_command(
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"-c {shlex.quote(f'DROP DATABASE IF EXISTS {ident} WITH (FORCE);')}"
+        )
+        if not run_command(
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"-c {shlex.quote(f'CREATE DATABASE {ident};')}"
+        ):
+            print_error(f"Failed to create database '{db}'")
+            return False
+        print_info(f"Restoring {sql_file} → {db}  (may take a while)...")
+        if not run_command(
+            f"cd {PASARGUARD_DIR} && cat {db_dir}/{sql_file} | "
+            f"docker compose exec -T {svc} psql -U pasarguard -d {shlex.quote(db)}"
+        ):
+            print_error(f"Failed to restore {sql_file}")
+            return False
+    return True
+
+# ── MySQL / MariaDB remote restore ────────────────────────────
+def _restore_mysql_remote(ssh, db_dir, svc, entries):
+    for db, sql_file, _, _ in entries:
+        print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
+        # The official script tries four credential fallbacks; for the simple
+        # case we read MYSQL_ROOT_PASSWORD / DB_PASSWORD from the restored
+        # .env (it's already on the remote host in /opt/pasarguard/.env).
+        ec, env_text, _ = ssh_shell(ssh, f"grep -E '^(DB_PASSWORD|MYSQL_ROOT_PASSWORD|DB_USER|DB_NAME)=' {PASARGUARD_DIR}/.env")
+        env_lines = {}
+        for ln in env_text.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                env_lines[k.strip()] = v.strip().strip('"').strip("'")
+        root_pwd = env_lines.get("MYSQL_ROOT_PASSWORD", "")
+        user_pwd = env_lines.get("DB_PASSWORD", "")
+        user     = env_lines.get("DB_USER", "root")
+
+        # Prefer the app user (least privilege), fall back to root
+        candidates = []
+        if user and user_pwd:
+            candidates.append((user, user_pwd))
+        if root_pwd:
+            candidates.append(("root", root_pwd))
+
+        restored = False
+        for cred_user, cred_pwd in candidates:
+            env_prefix = f"MYSQL_PWD={shlex.quote(cred_pwd)}" if cred_pwd else ""
+            cmd = (
+                f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
+                f"{env_prefix} docker compose exec -T {svc} mysql -u {shlex.quote(cred_user)}"
+            )
+            ec2, _, _ = ssh_shell(ssh, cmd)
+            if ec2 == 0:
+                print_success(f"Restored using credentials for user '{cred_user}'.")
+                restored = True
+                break
+        if not restored:
+            print_error(f"Failed to restore {sql_file} with any known credentials.")
+            return False
+    return True
+
+# ── MySQL / MariaDB local restore ─────────────────────────────
+def _restore_mysql_local(db_dir, svc, entries):
+    env = _read_env_file(os.path.join(PASARGUARD_DIR, ".env"))
+    root_pwd = env.get("MYSQL_ROOT_PASSWORD", "")
+    user_pwd = env.get("DB_PASSWORD", "")
+    user     = env.get("DB_USER", "root")
+
+    candidates = []
+    if user and user_pwd:
+        candidates.append((user, user_pwd))
+    if root_pwd:
+        candidates.append(("root", root_pwd))
+
+    for db, sql_file, _, _ in entries:
+        print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
+        restored = False
+        for cred_user, cred_pwd in candidates:
+            env_prefix = f"MYSQL_PWD={shlex.quote(cred_pwd)}" if cred_pwd else ""
+            cmd = (
+                f"cd {PASARGUARD_DIR} && cat {db_dir}/{sql_file} | "
+                f"{env_prefix} docker compose exec -T {svc} mysql -u {shlex.quote(cred_user)}"
+            )
+            if run_command(cmd, quiet=True):
+                print_success(f"Restored using credentials for user '{cred_user}'.")
+                restored = True
+                break
+        if not restored:
+            print_error(f"Failed to restore {sql_file} with any known credentials.")
+            return False
+    return True
+
+# ── SQLite remote restore ─────────────────────────────────────
+def _restore_sqlite_remote(ssh, db_dir, entries):
+    for db, sql_file, _, _ in entries:
+        # Find where the live sqlite file should land on the remote host
+        ec, env_text, _ = ssh_shell(ssh, f"grep -E '^SQLALCHEMY_DATABASE_URL=' {PASARGUARD_DIR}/.env")
+        target = "/var/lib/pasarguard/db.sqlite3"
+        if "=" in env_text:
+            url = env_text.split("=", 1)[1].strip().strip('"').strip("'")
+            path = url.split("://", 1)[-1].lstrip("/")
+            if path and not path.startswith(":"):
+                target = "/" + path
+        print_info(f"Restoring SQLite database → {target}")
+        # Stop the panel container, drop wal/shm, copy the new file, restart
+        execute_ssh_command(ssh, "cd /opt/pasarguard && docker compose stop pasarguard", "Stopping panel", required=False)
+        execute_ssh_command(ssh, f"rm -f {shlex.quote(target)} {shlex.quote(target)}-wal {shlex.quote(target)}-shm", "Removing old SQLite + WAL/SHM", required=False)
+        if not execute_ssh_command(
+            ssh,
+            f"cp {shlex.quote(db_dir)}/{shlex.quote(sql_file)} {shlex.quote(target)} && chmod 0644 {shlex.quote(target)}",
+            f"Restoring SQLite file {sql_file}",
+            required=True,
+        ):
+            return False
+        execute_ssh_command(ssh, "cd /opt/pasarguard && docker compose start pasarguard", "Starting panel", required=False)
+    return True
+
+# ── SQLite local restore ──────────────────────────────────────
+def _restore_sqlite_local(db_dir, entries):
+    env = _read_env_file(os.path.join(PASARGUARD_DIR, ".env"))
+    target = "/var/lib/pasarguard/db.sqlite3"
+    url = env.get("SQLALCHEMY_DATABASE_URL", "")
+    if url.startswith("sqlite"):
+        path = url.split("://", 1)[-1].lstrip("/")
+        if path and not path.startswith(":"):
+            target = "/" + path
+
+    for db, sql_file, _, _ in entries:
+        print_info(f"Restoring SQLite database → {target}")
+        run_command("cd /opt/pasarguard && docker compose stop pasarguard", quiet=True)
+        run_command(f"rm -f {shlex.quote(target)} {shlex.quote(target)}-wal {shlex.quote(target)}-shm", quiet=True)
+        if not run_command(
+            f"cp {db_dir}/{sql_file} {shlex.quote(target)} && chmod 0644 {shlex.quote(target)}"
+        ):
+            print_error(f"Failed to restore SQLite file {sql_file}")
+            return False
+        run_command("cd /opt/pasarguard && docker compose start pasarguard", quiet=True)
+    return True
+
 def workflow_transfer():
     print_header("Auto Backup & Transfer to New Server")
 
@@ -941,8 +1683,21 @@ def workflow_transfer():
         execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {zip_fn}",
                             "Extracting files")
 
-        remote_db_svc = db_service_ssh(ssh, PASARGUARD_DIR)
-        print_info(f"Detected database service: {remote_db_svc}")
+        # v4.1 — auto-detect the target server's database backend from the
+        # freshly extracted .env (works for sqlite, postgresql, timescaledb,
+        # mysql, mariadb).
+        try:
+            remote_backend = _detect_backend_ssh(ssh)
+        except Exception as e:
+            print_warning(f"Backend detection failed on remote: {e} — assuming legacy postgres")
+            remote_backend = {"type": "postgresql", "container": None, "dbname": "pasarguard",
+                              "user": "pasarguard", "password": "", "env": {}, "services": [],
+                              "host": "127.0.0.1", "port": 5432, "sqlite_path": None}
+        print_info(
+            f"Detected remote backend: {C.BOLD}{remote_backend['type']}{C.RESET}  "
+            f"db={remote_backend['dbname']}  container={remote_backend['container'] or '(none — sqlite)'}"
+        )
+
         execute_ssh_command(ssh,
             "cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true "
             "&& rm -rf /opt/pasarguard/pasarguard_data",
@@ -958,26 +1713,34 @@ def workflow_transfer():
                 "&& rm -rf /opt/pasarguard/pg_node_data",
                 "Restoring PG-Node data")
 
+        # SQLite: no DB container to start — restore the file and bring up the panel.
+        if remote_backend["type"] == "sqlite":
+            if not _restore_databases_remote(ssh, "db_dump", None, backend_type="sqlite"):
+                print_error("SQLite restore failed. Aborting.")
+                return
+            if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
+                print_error("Pasarguard did not start. Aborting.")
+                return
+            if include_node and not start_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
+                print_error("PG-Node did not start.")
+            print_header("Transfer & Restore Completed Successfully!")
+            print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") +
+                          " running on the new server.")
+            return
+
+        remote_db_svc = remote_backend["container"]
+        if not remote_db_svc:
+            print_error(f"Could not determine the {remote_backend['type']} container for restore.")
+            return
+
         if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB",
                                   services=[remote_db_svc], wait_postgres=True):
             print_error(f"{remote_db_svc} did not start. Aborting.")
             return
 
-        execute_ssh_command(ssh,
-            f'cd /opt/pasarguard && docker compose exec -T {remote_db_svc} psql -U pasarguard -d postgres '
-            '-c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"',
-            "Dropping old database")
-        execute_ssh_command(ssh,
-            f'cd /opt/pasarguard && docker compose exec -T {remote_db_svc} psql -U pasarguard -d postgres '
-            '-c "CREATE DATABASE pasarguard;"',
-            "Creating fresh database")
-        execute_ssh_command(ssh,
-            f"cd /opt/pasarguard && cat pg_dump/globals.sql | docker compose exec -T {remote_db_svc} psql -U pasarguard",
-            "Restoring globals.sql")
-        execute_ssh_command(ssh,
-            f"cd /opt/pasarguard && cat pg_dump/db-001.sql | docker compose exec -T {remote_db_svc} psql "
-            "-U pasarguard -d pasarguard",
-            "Restoring db-001.sql (may take a while for large DBs)")
+        if not _restore_databases_remote(ssh, "db_dump", remote_db_svc, backend_type=remote_backend["type"]):
+            print_error("Database restore failed. Aborting.")
+            return
 
         if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
             print_error("Pasarguard did not start. Aborting.")
@@ -1151,34 +1914,42 @@ def workflow_manual_restore():
             run_command("cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true")
             run_command("rm -rf /opt/pasarguard/pg_node_opt /opt/pasarguard/pg_node_data")
 
-        local_db_svc = db_service_local(PASARGUARD_DIR)
+        # v4.1 — auto-detect the actual backend type from the freshly extracted .env
+        try:
+            backend = _detect_backend_local()
+        except Exception as e:
+            print_warning(f"Backend detection failed: {e} — assuming legacy postgres")
+            backend = {"type": "postgresql", "container": None, "dbname": "pasarguard",
+                       "user": "pasarguard", "password": "", "env": {}, "services": [],
+                       "host": "127.0.0.1", "port": 5432, "sqlite_path": None}
+        print_info(
+            f"Detected backend: {C.BOLD}{backend['type']}{C.RESET}  "
+            f"db={backend['dbname']}  container={backend['container'] or '(none — sqlite)'}"
+        )
+
+        # SQLite: no DB container to start — just restore the file and bring the panel up.
+        if backend["type"] == "sqlite":
+            if not _restore_databases_local("db_dump", None, backend_type="sqlite"):
+                raise Exception("SQLite restore failed.")
+            if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
+                raise Exception("Pasarguard did not start")
+            if include_node and not start_compose_local(PG_NODE_DIR, "PG-Node"):
+                print_error("PG-Node did not start.")
+            print_header("Local Restore Completed Successfully!")
+            print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running.")
+            return
+
+        local_db_svc = backend["container"]
+        if not local_db_svc:
+            raise Exception(f"Could not determine the {backend['type']} container for restore.")
         print_info(f"Detected database service: {local_db_svc}")
 
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard DB",
                                     services=[local_db_svc], wait_postgres=True):
             raise Exception(f"{local_db_svc} did not start")
 
-        print_info("Dropping old database...")
-        if not run_command(f'cd /opt/pasarguard && docker compose exec -T {local_db_svc} psql '
-                           '-U pasarguard -d postgres '
-                           '-c "DROP DATABASE IF EXISTS pasarguard WITH (FORCE);"'):
-            raise Exception("Failed to drop old database")
-
-        print_info("Creating fresh database...")
-        if not run_command(f'cd /opt/pasarguard && docker compose exec -T {local_db_svc} psql '
-                           '-U pasarguard -d postgres -c "CREATE DATABASE pasarguard;"'):
-            raise Exception("Failed to create database")
-
-        print_info("Restoring globals.sql...")
-        if not run_command(f"cd /opt/pasarguard && cat pg_dump/globals.sql | "
-                           f"docker compose exec -T {local_db_svc} psql -U pasarguard"):
-            raise Exception("Failed to restore globals.sql")
-
-        print_info("Restoring db-001.sql (may take a while)...")
-        if not run_command(f"cd /opt/pasarguard && cat pg_dump/db-001.sql | "
-                           f"docker compose exec -T {local_db_svc} psql -U pasarguard -d pasarguard"):
-            raise Exception("Failed to restore db-001.sql")
-            raise Exception("Failed to restore db-001.sql")
+        if not _restore_databases_local("db_dump", local_db_svc, backend_type=backend["type"]):
+            raise Exception("Database restore failed.")
 
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
             raise Exception("Pasarguard did not start")
