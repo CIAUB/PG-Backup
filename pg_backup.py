@@ -795,23 +795,33 @@ def _detect_db_service_ssh(ssh, d=None):
 
 def _pick_db_service(services):
     """Pick the DB service name out of a list of compose services.
-    Falls back to asking the user if it can't decide on its own."""
+    Falls back to asking the user if it can't decide on its own.
+
+    v4.2.1 — strips any non-service top-level keys that slipped through
+    the parser (e.g. `services`, `name`, `version`). Without this, a buggy
+    parser returning `['services']` would cause the script to try to
+    exec into a non-existent service literally called 'services'."""
     if not services:
         print_warning("Could not read docker-compose services — defaulting to 'timescaledb'.")
         return "timescaledb"
 
-    if len(services) == 1:
-        return services[0]
+    safe = [s for s in services if s not in _NON_SERVICE_KEYS and _SAFE_SERVICE_NAME_RE.match(s)]
+    if not safe:
+        print_warning("No valid service names in compose output — defaulting to 'timescaledb'.")
+        return "timescaledb"
+
+    if len(safe) == 1:
+        return safe[0]
 
     keywords = ["timescaledb", "postgres", "postgresql", "pgsql", "db", "database"]
-    candidates = [s for s in services if any(k in s.lower() for k in keywords)]
+    candidates = [s for s in safe if any(k in s.lower() for k in keywords)]
 
     if len(candidates) == 1:
         return candidates[0]
 
-    print_warning(f"Multiple candidate DB services found: {', '.join(candidates or services)}")
+    print_warning(f"Multiple candidate DB services found: {', '.join(candidates or safe)}")
     choice = input(f" {C.R2}> Which service is the PostgreSQL database? {C.RESET}").strip()
-    return choice if choice in services else (candidates[0] if candidates else services[0])
+    return choice if choice in safe else (candidates[0] if candidates else safe[0])
 
 def db_service_local(d=None):
     return _detect_db_service_local(d)
@@ -945,23 +955,7 @@ def _list_compose_services_local(d=None):
                 out = f.read()
         except FileNotFoundError:
             return []
-    services = []
-    current = None
-    img = None
-    for line in out.splitlines():
-        stripped = line.rstrip()
-        if not stripped.startswith(" ") and stripped.endswith(":") and not stripped.startswith("#"):
-            if current and img:
-                services.append((current, img))
-            current = stripped[:-1].strip()
-            img = None
-            continue
-        s = stripped.strip()
-        if s.startswith("image:"):
-            img = s.split(":", 1)[1].strip().strip('"').strip("'")
-    if current and img:
-        services.append((current, img))
-    return services
+    return _parse_compose_services(out)
 
 def _list_compose_services_ssh(ssh, d=None):
     d = d or PASARGUARD_DIR
@@ -971,23 +965,89 @@ def _list_compose_services_ssh(ssh, d=None):
         if ec2 != 0:
             return []
         out = out2
-    services = []
-    current = None
-    img = None
-    for line in out.splitlines():
-        stripped = line.rstrip()
-        if not stripped.startswith(" ") and stripped.endswith(":") and not stripped.startswith("#"):
-            if current and img:
-                services.append((current, img))
-            current = stripped[:-1].strip()
-            img = None
+    return _parse_compose_services(out)
+
+# Top-level keys that look like service names but aren't (would cause the
+# script to try to exec into a non-existent "services" / "name" / "version"
+# container if they leaked through a buggy parser). Defence in depth.
+_NON_SERVICE_KEYS = frozenset({
+    "services", "name", "version", "networks", "volumes",
+    "configs", "secrets", "x-*",
+})
+
+def _parse_compose_services(yaml_text):
+    """Parse `docker compose config` output (or raw docker-compose.yml) and
+    return [(service_name, image_string), ...] for every service that has
+    an image defined.
+
+    v4.2.1 — the previous parser only matched top-level keys (no leading
+    whitespace + ends with ':'), so on the canonical compose output
+
+        services:
+          timescaledb:
+            image: timescale/timescaledb:latest
+          pasarguard:
+            image: ...
+
+    it captured ('services', 'timescale/...') — i.e. it tried to exec into
+    a service literally called `services` — and missed the real service
+    names entirely. This parser walks the YAML by indentation: only keys
+    indented under the `services:` block are treated as service names,
+    and only `image:` lines indented under a service count as that
+    service's image."""
+    services = {}  # name -> image
+    in_services_block = False
+    current_service = None
+    services_indent = None  # indent of `services:` itself
+
+    for raw in yaml_text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
             continue
-        s = stripped.strip()
-        if s.startswith("image:"):
-            img = s.split(":", 1)[1].strip().strip('"').strip("'")
-    if current and img:
-        services.append((current, img))
-    return services
+        stripped = raw.lstrip()
+        indent = len(raw) - len(stripped)
+
+        # Top-level key detection. `services:` opens the block we care
+        # about; any other top-level key closes it.
+        if indent == 0:
+            if stripped == "services:":
+                in_services_block = True
+                services_indent = 0
+                current_service = None
+                continue
+            if in_services_block:
+                # We've left the services block (e.g. hit `volumes:`,
+                # `networks:`, etc).
+                in_services_block = False
+                current_service = None
+                continue
+            continue
+
+        if not in_services_block:
+            continue
+
+        # We're inside the services: block. Lines at indent == 2 that end
+        # with ':' are service names; their image: child defines the image.
+        if (indent == 2 and stripped.endswith(":")
+                and not stripped.startswith("-")
+                and not stripped.startswith("&")  # YAML anchors
+                and not stripped.startswith("*")):  # YAML aliases
+            current_service = stripped[:-1].strip().strip("'\"")
+            if current_service and current_service not in _NON_SERVICE_KEYS:
+                services.setdefault(current_service, "")
+            else:
+                current_service = None  # ignore non-service keys just in case
+            continue
+
+        # We're inside a specific service — look for the image: line.
+        if current_service and indent >= 4 and stripped.startswith("image:"):
+            image = stripped[len("image:"):].strip()
+            if len(image) >= 2 and image[0] == image[-1] and image[0] in ('"', "'"):
+                image = image[1:-1]
+            services[current_service] = image
+
+    # Only return services that have an image (real running containers —
+    # build-only / external services without `image:` can't be exec'd into).
+    return [(name, img) for name, img in services.items() if img]
 
 def _detect_backend_local():
     env = _read_env_file(os.path.join(PASARGUARD_DIR, ".env"))
