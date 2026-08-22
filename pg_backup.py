@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v4.1
+#   Pasarguard Backup Utility  v4.2
 #   Dev by: CIA
 #   GitHub: https://github.com/CIAUB
 #   v4.0 — multi-database support: backs up & restores EVERY Pasarguard DB
@@ -10,11 +10,34 @@
 #          five supported backends — sqlite, postgresql, timescaledb, mysql,
 #          mariadb — including single-file sqlite backups, mysqldump for
 #          MySQL/MariaDB, and per-database pg_dump for PostgreSQL/TimescaleDB.
+#   v4.2 — security & bugfix pass:
+#          * fixed shell command injection in Manual Restore (zip filename
+#            was interpolated unquoted into a shell=True command)
+#          * fixed MySQL/MariaDB backup & restore: MYSQL_PWD is now passed
+#            into the container via `docker compose exec -e`, not set on the
+#            host process (which docker compose does not forward)
+#          * bot token / chat id no longer passed as plaintext CLI args
+#            (leaked via `ps`/`/proc/<pid>/cmdline` and world-readable
+#            systemd unit files) — now written to a 0600 credentials file
+#          * passwords are now read with getpass (no terminal echo)
+#          * backup archives are chmod 600 on disk (they contain .env
+#            secrets)
+#          * SSH host-key auto-accept now prints an explicit warning
+#          * Telegram Bot API's 50 MB per-file limit is fully handled:
+#            oversized backups are transparently split into numbered
+#            .001/.002/... chunks on send, and on the restore side
+#            (Manual Restore) the chunks are auto-detected, verified for
+#            completeness, and rejoined into the original archive before
+#            extraction — no manual `cat` needed.
+#          * "Manage Backup Schedulers" can now restart an instance so it
+#            picks up the latest script code without deleting and
+#            recreating it, and can update a running scheduler's bot
+#            token / admin chat ID in place.
 # ============================================================
 
 import os, sys, subprocess, datetime, shutil
 import time, urllib.request, urllib.error, uuid, threading, itertools
-import argparse, shlex, socket
+import argparse, shlex, socket, getpass, json, stat
 
 # ── ANSI Colors ──────────────────────────────────────────────
 # Three red tones for hierarchy:
@@ -141,6 +164,76 @@ TMUX_SESSION_BASE      = "pasarguard_backup"
 SYSTEMD_SERVICE_BASE   = "pasarguard-backup"
 SYSTEMD_UNIT_DIR       = "/etc/systemd/system"
 
+# v4.2 — credentials directory for scheduler daemons. Files here hold the
+# bot token / chat id / proxy for a given scheduler instance instead of
+# passing them as CLI arguments (which leak via `ps`, /proc/<pid>/cmdline,
+# and world-readable systemd unit files). Each file is chmod 600.
+CREDS_DIR = "/etc/pasarguard-backup"
+
+def _creds_path(instance):
+    safe = instance or "default"
+    return os.path.join(CREDS_DIR, f"{safe}.json")
+
+def write_daemon_creds(instance, bot_token, admin_id, proxy=None, interval_h=None, include_node=None):
+    """Persist everything a scheduler instance needs to run: token, chat id,
+    proxy, interval, and scope. Storing interval/include_node here (not just
+    token/chat) means 'Manage Backup Schedulers' can fully reconstruct the
+    daemon command later — to restart a screen/tmux session with the exact
+    same settings, or to push an updated token/chat id — without asking the
+    user to re-enter everything from scratch. Merges with any existing file
+    so partial updates (e.g. token-only) don't wipe out other fields."""
+    os.makedirs(CREDS_DIR, exist_ok=True)
+    try:
+        os.chmod(CREDS_DIR, 0o700)
+    except Exception:
+        pass
+    path = _creds_path(instance)
+    existing = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    data = {
+        "token":    bot_token if bot_token is not None else existing.get("token", ""),
+        "chat":     admin_id if admin_id is not None else existing.get("chat", ""),
+        "proxy":    (proxy if proxy is not None else existing.get("proxy", "")) or "",
+        "interval": interval_h if interval_h is not None else existing.get("interval", 1.0),
+        "node":     include_node if include_node is not None else existing.get("node", False),
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.chmod(path, 0o600)
+    return path
+
+def read_daemon_creds(instance):
+    path = _creds_path(instance)
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("token", ""), data.get("chat", ""), (data.get("proxy") or None)
+
+def read_daemon_meta(instance):
+    """Full stored config for a scheduler instance (token/chat/proxy/interval/
+    node), or None if no credentials file exists for it. Used by 'Manage
+    Backup Schedulers' to rebuild the exact daemon command for a restart."""
+    path = _creds_path(instance)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    return {
+        "token":    data.get("token", ""),
+        "chat":     data.get("chat", ""),
+        "proxy":    data.get("proxy") or None,
+        "interval": data.get("interval", 1.0),
+        "node":     bool(data.get("node", False)),
+    }
+
 # Per-instance status files so the "Manage Backup Schedulers" menu can show
 # whether an instance is currently backing up or sleeping until its next run,
 # instead of just a raw process-alive check.
@@ -184,7 +277,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 1   -   C I A U B" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 2   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
@@ -249,21 +342,21 @@ def ensure_tool_installed(binary, pkg=None):
     print_error(f"Failed to install '{pkg}'. Please install it manually and try again.")
     return False
 
-def build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy=None, instance=None):
-    """Builds the exact CLI invocation used to re-run this same script headlessly."""
+def build_daemon_command(interval_h, include_node, instance=None):
+    """Builds the exact CLI invocation used to re-run this same script
+    headlessly. v4.2: the bot token / chat id / proxy are NOT passed here
+    any more — they're written to a 0600 credentials file (see
+    write_daemon_creds) and the daemon reads them back by --instance name,
+    so they never appear in `ps`, /proc/<pid>/cmdline, or a systemd unit
+    file (which is world-readable by default)."""
     script_path = os.path.abspath(__file__)
     parts = [
         sys.executable, script_path, "--daemon-backup",
-        "--token", bot_token,
-        "--chat", admin_id,
         "--interval", str(interval_h),
+        "--instance", instance or "default",
     ]
     if include_node:
         parts.append("--node")
-    if proxy:
-        parts += ["--proxy", proxy]
-    if instance:
-        parts += ["--instance", instance]
     return " ".join(shlex.quote(p) for p in parts)
 
 def systemd_unit_name(suffix):
@@ -293,9 +386,6 @@ def list_systemd_backup_units():
                 continue
             suffix = name[len(SYSTEMD_SERVICE_BASE) + 1:]
             # columns are: UNIT LOAD ACTIVE SUB DESCRIPTION...
-            # parts[2] = ACTIVE ("active"/"inactive"), parts[3] = SUB ("running"/"dead"/...)
-            # Checking parts[2] here was the bug that made a perfectly healthy,
-            # sleeping-between-backups service show up as STOPPED.
             active = len(parts) > 3 and parts[2] == "active" and parts[3] in ("running", "start-pre", "start")
             units.append((suffix, name, active))
     return units
@@ -451,6 +541,10 @@ def launch_via_systemd(daemon_cmd, unit_name=None):
     try:
         with open(unit_path, "w") as f:
             f.write(unit)
+        # v4.2: unit files are world-readable by default (0644). The daemon
+        # command no longer contains secrets (see build_daemon_command), but
+        # keep the unit itself tight anyway.
+        os.chmod(unit_path, 0o600)
     except Exception as e:
         print_error(f"Could not write unit file: {e}")
         return False
@@ -529,17 +623,9 @@ def db_service_ssh(ssh, d=None):
     return _detect_db_service_ssh(ssh, d)
 
 # ── Multi-database discovery (v4.0) ───────────────────────────
-# PasarGuard may use several PostgreSQL databases (the legacy "pasarguard"
-# plus any extra ones added by nodes / add-ons).  The old v3.x code only
-# backed up the single "pasarguard" database; this version discovers EVERY
-# non-template, non-system database on the server and dumps them all into
-# the archive, with a manifest that tells the restore side what to do.
 _SYSTEM_DBS = ("postgres", "template0", "template1")
 
 def _list_databases_local(svc):
-    """Return a sorted list of all non-template, non-system database names
-    on the local Pasarguard Postgres instance. Falls back to ['pasarguard']
-    if the query fails (so single-DB legacy installs still work)."""
     query = ("SELECT datname FROM pg_database "
              "WHERE datistemplate=false AND datname NOT IN "
              "('postgres','template0','template1') ORDER BY datname;")
@@ -557,7 +643,6 @@ def _list_databases_local(svc):
     return names
 
 def _list_databases_ssh(ssh, svc):
-    """Same as _list_databases_local, but against the remote (target) host."""
     query = ("SELECT datname FROM pg_database "
              "WHERE datistemplate=false AND datname NOT IN "
              "('postgres','template0','template1') ORDER BY datname;")
@@ -580,18 +665,9 @@ def _ident(name):
     return '"' + name.replace('"', '""') + '"'
 
 # ── PasarGuard backend detection (v4.1) ──────────────────────
-# The official panel (https://github.com/PasarGuard/panel) supports five
-# database backends: sqlite, postgresql, timescaledb, mysql, mariadb.
-# We detect which one is in use by reading SQLALCHEMY_DATABASE_URL from
-# /opt/pasarguard/.env, and we use the docker-compose image name to
-# differentiate timescaledb from plain postgresql and mariadb from mysql.
 SUPPORTED_BACKENDS = ("sqlite", "postgresql", "timescaledb", "mysql", "mariadb")
 
 def _read_env_file(path):
-    """Read a dotenv-style file and return {KEY: raw_value}. Values are
-    returned verbatim (no shell-expansion, no type coercion) so secrets stay
-    intact. Lines starting with '#', blank lines, and inline comments after
-    a value are skipped."""
     out = {}
     try:
         with open(path) as f:
@@ -604,7 +680,6 @@ def _read_env_file(path):
                 k, v = line.split("=", 1)
                 k = k.strip()
                 v = v.strip()
-                # Strip surrounding quotes
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
                     v = v[1:-1]
                 out[k] = v
@@ -613,7 +688,6 @@ def _read_env_file(path):
     return out
 
 def _mask_secret(value):
-    """Show only the last 4 characters of a secret for display purposes."""
     if not value:
         return ""
     if len(value) <= 4:
@@ -621,34 +695,21 @@ def _mask_secret(value):
     return f"****{value[-4:]}"
 
 def _parse_sqlalchemy_url(url):
-    """Return (scheme, user, password, host, port, dbname) for a
-    SQLAlchemy URL like:
-        postgresql+asyncpg://user:pass@host:5432/dbname
-        mysql+asyncmy://user:pass@host:3306/dbname
-        sqlite+aiosqlite:///var/lib/pasarguard/db.sqlite3
-    Returns (None,...) if the URL is unparseable."""
     if not url:
         return (None, None, None, None, None, None)
-    # Strip SQLAlchemy driver suffix (+asyncpg, +asyncmy, +aiosqlite, +pymysql, ...)
     try:
         scheme_full, rest = url.split("://", 1)
     except ValueError:
         return (None, None, None, None, None, None)
     scheme = scheme_full.split("+", 1)[0].lower()
 
-    # SQLite is special — no host/port/user, just a path.
     if scheme == "sqlite":
-        # SQLAlchemy uses one extra leading '/' to mark absolute paths:
-        #   sqlite:///relative.db     -> "relative.db"
-        #   sqlite:////absolute/x.db  -> "/absolute/x.db"
-        # So strip at most one leading '/' to preserve the absolute-path '/'.
         if rest.startswith("//"):
-            rest = rest[1:]  # leave one '/' for absolute paths
+            rest = rest[1:]
         elif rest.startswith("/"):
-            pass  # already a single '/' — keep as-is
+            pass
         return (scheme, None, None, None, None, rest)
 
-    # user[:password]@host[:port]/dbname
     user = password = host = port = dbname = None
     if "@" in rest:
         creds, rest = rest.split("@", 1)
@@ -656,7 +717,6 @@ def _parse_sqlalchemy_url(url):
             user, password = creds.split(":", 1)
         else:
             user = creds
-    # Strip query string
     if "?" in rest:
         rest = rest.split("?", 1)[0]
     if "/" in rest:
@@ -675,20 +735,14 @@ def _parse_sqlalchemy_url(url):
     return (scheme, user, password, host, port, dbname)
 
 def _compose_image_contains(svc_image, needle):
-    """True if the compose service's image string contains `needle`
-    (case-insensitive substring match)."""
     if not svc_image:
         return False
     return needle.lower() in svc_image.lower()
 
 def _list_compose_services_local(d=None):
-    """Return [(service_name, image_string), ...] from docker compose config.
-    Best-effort: uses `docker compose config` if available, otherwise parses
-    docker-compose.yml as text."""
     d = d or PASARGUARD_DIR
     ok_v, out, _ = local_shell("docker compose config 2>/dev/null", cwd=d)
     if not ok_v or not out:
-        # Fall back to a text parse of docker-compose.yml
         try:
             with open(os.path.join(d, "docker-compose.yml")) as f:
                 out = f.read()
@@ -699,7 +753,6 @@ def _list_compose_services_local(d=None):
     img = None
     for line in out.splitlines():
         stripped = line.rstrip()
-        # Lines like "  timescaledb:" start a service; "  image: ..." gives its image
         if not stripped.startswith(" ") and stripped.endswith(":") and not stripped.startswith("#"):
             if current and img:
                 services.append((current, img))
@@ -714,7 +767,6 @@ def _list_compose_services_local(d=None):
     return services
 
 def _list_compose_services_ssh(ssh, d=None):
-    """Same as _list_compose_services_local but over SSH."""
     d = d or PASARGUARD_DIR
     ec, out, _ = ssh_shell(ssh, f"cd {d} && docker compose config 2>/dev/null")
     if ec != 0 or not out:
@@ -741,9 +793,6 @@ def _list_compose_services_ssh(ssh, d=None):
     return services
 
 def _detect_backend_local():
-    """Read /opt/pasarguard/.env, parse SQLALCHEMY_DATABASE_URL, scan
-    docker-compose.yml for the DB image, and return a backend dict with
-    keys: type, host, port, user, password, dbname, container, env, services."""
     env = _read_env_file(os.path.join(PASARGUARD_DIR, ".env"))
     url = env.get("SQLALCHEMY_DATABASE_URL", "")
     scheme, user, pwd, host, port, dbname = _parse_sqlalchemy_url(url)
@@ -751,12 +800,9 @@ def _detect_backend_local():
     return _resolve_backend(scheme, user, pwd, host, port, dbname, env, services)
 
 def _detect_backend_ssh(ssh):
-    """Same as _detect_backend_local but reads the .env and compose file
-    on the remote host."""
     ec, env_text, _ = ssh_shell(ssh, f"cat {PASARGUARD_DIR}/.env 2>/dev/null")
     env = {}
     if ec == 0 and env_text:
-        # Parse the remote .env inline (don't write to a local temp file)
         for raw in env_text.splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -773,17 +819,13 @@ def _detect_backend_ssh(ssh):
     return _resolve_backend(scheme, user, pwd, host, port, dbname, env, services)
 
 def _resolve_backend(scheme, user, pwd, host, port, dbname, env, services):
-    """Build the final backend config from already-parsed URL parts,
-    the env-var map, and the list of (service_name, image) tuples.
-    Falls back to legacy Postgres defaults if anything is missing."""
     db_type = None
     container = None
 
     if scheme == "sqlite":
         db_type = "sqlite"
-        container = None  # no DB container for SQLite
+        container = None
     elif scheme == "postgresql":
-        # Differentiate timescaledb from plain postgres by the compose image.
         is_ts = any(_compose_image_contains(img, "timescale") for _, img in services)
         db_type = "timescaledb" if is_ts else "postgresql"
         container = _pick_service_by_image(services,
@@ -798,14 +840,12 @@ def _resolve_backend(scheme, user, pwd, host, port, dbname, env, services):
             name_needles=("mariadb", "mysql", "db", "database"),
         )
     else:
-        # Unknown scheme — fall back to legacy v3.x defaults (pasarguard+postgres)
         db_type = "postgresql"
         container = _pick_service_by_image(services,
             image_needles=("timescaledb", "postgres", "postgresql", "pgsql"),
             name_needles=("timescaledb", "postgres", "postgresql", "pgsql", "db", "database"),
         )
 
-    # Backfill missing creds from the .env DB_* keys
     if not user:   user   = env.get("DB_USER", "")
     if not pwd:    pwd    = env.get("DB_PASSWORD", "")
     if not dbname: dbname = env.get("DB_NAME", "pasarguard")
@@ -818,10 +858,9 @@ def _resolve_backend(scheme, user, pwd, host, port, dbname, env, services):
         else:
             port = 0
 
-    # For SQLite, the on-disk path is in the URL after the scheme
     sqlite_path = None
     if db_type == "sqlite" and dbname:
-        sqlite_path = "/" + dbname  # dbname was the rest of the URL
+        sqlite_path = "/" + dbname
 
     return {
         "type":       db_type,
@@ -837,24 +876,18 @@ def _resolve_backend(scheme, user, pwd, host, port, dbname, env, services):
     }
 
 def _pick_service_by_image(services, image_needles=(), name_needles=()):
-    """Pick the most likely DB service from a list of (name, image) tuples.
-    Prefers exact image matches, then name-substring matches, then any service
-    that looks like a database. Returns the service name or None."""
     if not services:
         return None
     if len(services) == 1:
         return services[0][0]
-    # 1. Exact image match
     for needle in image_needles:
         for name, img in services:
             if img.lower() == needle.lower():
                 return name
-    # 2. Substring image match
     for needle in image_needles:
         for name, img in services:
             if needle.lower() in img.lower():
                 return name
-    # 3. Substring service-name match
     for needle in name_needles:
         for name, _ in services:
             if needle.lower() in name.lower():
@@ -1071,7 +1104,7 @@ def send_telegram_file(token, chat_id, file_path, caption="", proxy=None):
             if _pysocks is None:
                 return False, "PySocks is required for SOCKS proxies but could not be installed"
             proxy_type = _pysocks.SOCKS4 if scheme.startswith("socks4") else _pysocks.SOCKS5
-            rdns = scheme in ("socks5h", "socks4a")  # resolve hostname through the proxy
+            rdns = scheme in ("socks5h", "socks4a")
             socks_ctx = _SocksProxySocket(proxy_type, host, port, user, pwd, rdns=rdns)
         elif scheme in ("http", "https"):
             opener = urllib.request.build_opener(
@@ -1095,14 +1128,11 @@ def send_telegram_file(token, chat_id, file_path, caption="", proxy=None):
         return False, str(e)
 
 def _parse_proxy_url(proxy):
-    """scheme://[user[:pass]@]host:port -> (scheme, host, port, user, pass)"""
     from urllib.parse import urlparse
     p = urlparse(proxy)
     return p.scheme.lower(), p.hostname, p.port, p.username, p.password
 
 class _SocksProxySocket:
-    """Temporarily routes socket.socket through a SOCKS4/5 proxy via PySocks,
-    then restores the original socket class no matter what happens."""
     def __init__(self, proxy_type, host, port, username=None, password=None, rdns=True):
         self.proxy_type = proxy_type
         self.host, self.port = host, port
@@ -1130,6 +1160,147 @@ def ask_telegram_proxy():
     ).strip()
     return proxy or None
 
+# ── Telegram file size handling ───────────────────────────────
+TELEGRAM_BOT_MAX_FILE_SIZE = 50 * 1024 * 1024
+TELEGRAM_SAFE_CHUNK_SIZE   = 49 * 1024 * 1024
+
+def _split_file_into_chunks(file_path, chunk_size=TELEGRAM_SAFE_CHUNK_SIZE):
+    file_size = os.path.getsize(file_path)
+    if file_size <= chunk_size:
+        return {"needs_split": False, "chunks": [file_path],
+                "original": file_path, "total_size": file_size}
+
+    base_dir  = os.path.dirname(file_path)
+    base_name = os.path.basename(file_path)
+    total     = (file_size + chunk_size - 1) // chunk_size
+
+    parts = []
+    with open(file_path, "rb") as src:
+        for i in range(1, total + 1):
+            chunk_path = os.path.join(base_dir, f"{base_name}.{i:03d}")
+            with open(chunk_path, "wb") as dst:
+                written = 0
+                while written < chunk_size:
+                    buf = src.read(min(chunk_size - written, 1024 * 1024))
+                    if not buf:
+                        break
+                    dst.write(buf)
+                    written += len(buf)
+            parts.append(chunk_path)
+
+    return {"needs_split": True, "chunks": parts,
+            "original": file_path, "total_size": file_size}
+
+
+def send_telegram_backup_archive(file_path, caption, token, chat_id, proxy=None):
+    if not os.path.exists(file_path):
+        return False, "File not found"
+
+    info     = _split_file_into_chunks(file_path)
+    chunks   = info["chunks"]
+    original = info["original"]
+    total    = len(chunks)
+
+    if info["needs_split"]:
+        size_mb = info["total_size"] / 1024 / 1024
+        print_warning(
+            f"Backup is {size_mb:.1f} MB — exceeds Telegram Bot API's "
+            f"50 MB limit. Splitting into {total} parts…"
+        )
+
+    try:
+        for idx, chunk_path in enumerate(chunks, 1):
+            chunk_mb = os.path.getsize(chunk_path) / 1024 / 1024
+            if info["needs_split"]:
+                base_name = os.path.basename(original)
+                cap = (
+                    f"{caption}\n"
+                    f"\n"
+                    f"Part {idx}/{total}  ({chunk_mb:.1f} MB)\n"
+                    f"\n"
+                    f"To rejoin all parts on the server:\n"
+                    f"  cat '{base_name}.*' > '{base_name}'\n"
+                    f"Then unzip normally."
+                )
+            else:
+                cap = caption
+            label = f"part {idx}/{total} " if info["needs_split"] else ""
+            print_info(f"Uploading {label}({chunk_mb:.1f} MB)…")
+            ok, details = send_telegram_file(token, chat_id, chunk_path, cap, proxy)
+            if not ok:
+                print_error(f"Upload failed: {details}")
+                return False, details
+            if info["needs_split"]:
+                print_success(f"Part {idx}/{total} sent.")
+            else:
+                print_success("Sent.")
+    finally:
+        if info["needs_split"]:
+            for chunk_path in chunks:
+                if chunk_path != original:
+                    try:
+                        os.remove(chunk_path)
+                    except Exception:
+                        pass
+
+    return True, "OK"
+
+
+def _join_chunks_if_needed(zip_name):
+    """If chunks matching `zip_name` (e.g. `backup.zip.001`, `.002`, ...)
+    exist in the same directory, automatically concatenate them into
+    `base` and return the joined path. Otherwise return `zip_name`
+    unchanged. Handles both the base name and the first-chunk name as
+    input. Returns None if chunks are incomplete (gaps in numbering)."""
+    import re, glob
+
+    base = zip_name
+    m = re.match(r"^(.*)\.(\d{3})$", zip_name)
+    if m:
+        base = m.group(1)
+
+    candidates = sorted(glob.glob(base + ".*"))
+    parts = [c for c in candidates if re.search(r"\.\d{3}$", c)]
+
+    if len(parts) < 2:
+        return base
+
+    nums = sorted(int(re.search(r"\.(\d{3})$", p).group(1)) for p in parts)
+    expected = list(range(1, len(parts) + 1))
+    if nums != expected:
+        missing = sorted(set(expected) - set(nums))
+        print_error(f"Incomplete chunks: found {len(parts)}, missing {missing}")
+        return None
+
+    print_info(f"Detected {len(parts)} Telegram chunks. Joining into {C.BOLD}{base}{C.RESET}…")
+    total_bytes = 0
+    with open(base, "wb") as out:
+        for p in parts:
+            sz = os.path.getsize(p)
+            print_info(f"  + {os.path.basename(p)} ({sz / 1024 / 1024:.1f} MB)")
+            with open(p, "rb") as f:
+                shutil.copyfileobj(f, out, length=1024 * 1024)
+            total_bytes += sz
+
+    print_success(f"Joined into {base} ({total_bytes / 1024 / 1024:.1f} MB total)")
+
+    yn = input(
+        f"  {C.R2}> Delete the {len(parts)} chunk files now that we have "
+        f"the joined archive? (y/n): {C.RESET}"
+    ).strip().lower()
+    if yn == "y":
+        for p in parts:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        print_success(f"Deleted {len(parts)} chunk files.")
+    else:
+        print_info("Chunks left on disk — delete them manually when no longer needed.")
+
+    return base
+
+
 # ── Backup scope selector ─────────────────────────────────────
 def ask_backup_scope():
     print()
@@ -1151,8 +1322,6 @@ def create_backup(include_node=True):
     scope_label = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
     print_info(f"Starting backup  scope: {C.BOLD}{scope_label}{C.RESET}")
 
-    # v4.1 — detect the actual database backend (sqlite / postgresql /
-    # timescaledb / mysql / mariadb) before doing anything else.
     try:
         backend = _detect_backend_local()
     except Exception as e:
@@ -1190,7 +1359,6 @@ def create_backup(include_node=True):
             if os.path.exists(src):
                 shutil.copy(src, tmp_dir)
 
-        # Backup the actual database, dispatching on the backend type.
         if not _backup_database_local(backend, db_dir):
             print_error("Database backup failed. Aborting.")
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1217,6 +1385,14 @@ def create_backup(include_node=True):
         print_info("Compressing archive...")
         shutil.make_archive(final_base, "zip", tmp_dir)
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # v4.2 — the archive contains .env (DB password, JWT/secret key, etc).
+        # Lock it down to the owner immediately.
+        try:
+            os.chmod(zip_path, 0o600)
+        except Exception:
+            pass
+
         print_success(f"Archive: {zip_path}")
         return zip_path
 
@@ -1227,8 +1403,6 @@ def create_backup(include_node=True):
 
 # ── Per-backend local backup dispatchers ──────────────────────
 def _backup_database_local(backend, db_dir):
-    """Dump the live PasarGuard database into `db_dir` and write a manifest.
-    Returns True on success, False on any error."""
     t = backend["type"]
     if t in ("postgresql", "timescaledb"):
         return _backup_postgres_local(backend, db_dir)
@@ -1240,11 +1414,9 @@ def _backup_database_local(backend, db_dir):
     return False
 
 def _backup_postgres_local(backend, db_dir):
-    """Dump every user database on a PostgreSQL or TimescaleDB instance."""
     svc = backend.get("container") or "postgres"
     user = backend["user"] or "pasarguard"
 
-    # globals.sql — roles, tablespaces, shared grants
     print_info("Exporting PostgreSQL globals (pg_dumpall)...")
     run_command(
         f"docker compose exec -T {svc} pg_dumpall -U {shlex.quote(user)} --globals-only",
@@ -1257,7 +1429,7 @@ def _backup_postgres_local(backend, db_dir):
 
     manifest_path = os.path.join(db_dir, "manifest.tsv")
     with open(manifest_path, "w") as mf:
-        mf.write(f"# pg_backup_manifest\tv4.1\tformat=tsv\tdb_type={backend['type']}\n")
+        mf.write(f"# pg_backup_manifest\tv4.2\tformat=tsv\tdb_type={backend['type']}\n")
         for idx, db in enumerate(databases, 1):
             sql_file = f"db-{idx:03d}.sql"
             has_ts, ts_ver = _pg_db_timescale_info(svc, user, db)
@@ -1274,8 +1446,6 @@ def _backup_postgres_local(backend, db_dir):
     return True
 
 def _pg_db_timescale_info(svc, user, dbname):
-    """Return (has_timescaledb_ext: bool, ext_version: str) for a database.
-    Returns (False, "") if the query fails or the extension isn't installed."""
     query = "SELECT extversion FROM pg_extension WHERE extname='timescaledb' LIMIT 1;"
     ok_v, out, _ = local_shell(
         f"docker compose exec -T {svc} psql -U {shlex.quote(user)} -d {shlex.quote(dbname)} "
@@ -1291,7 +1461,14 @@ def _pg_db_timescale_info(svc, user, dbname):
 
 def _backup_mysql_local(backend, db_dir):
     """Dump a single MySQL/MariaDB database (the official panel only uses
-    one DB per install)."""
+    one DB per install).
+
+    v4.2 fix: MYSQL_PWD must be set *inside the container*, not on the host
+    shell that runs `docker compose`. `docker compose exec` does not forward
+    the host environment to the container unless told to with `-e`, so the
+    previous `MYSQL_PWD=... docker compose exec ...` form silently had no
+    effect and mysqldump would hang on / fail an interactive password
+    prompt. Passing it via `exec -e` fixes that."""
     svc    = backend.get("container")
     user   = backend["user"] or "root"
     pwd    = backend["password"]
@@ -1301,12 +1478,12 @@ def _backup_mysql_local(backend, db_dir):
         print_error("Could not identify the MySQL/MariaDB container — aborting.")
         return False
 
-    env = f"MYSQL_PWD={shlex.quote(pwd)}" if pwd else ""
+    env_flag = f"-e MYSQL_PWD={shlex.quote(pwd)} " if pwd else ""
     sql_file = "db-001.sql"
     out_path = os.path.join(db_dir, sql_file)
     print_info(f"Exporting {backend['type']} database {C.BOLD}{dbname}{C.RESET} → {sql_file}  (may take a while)")
     ok = run_command(
-        f"{env} docker compose exec -T {svc} mysqldump "
+        f"docker compose exec -T {env_flag}{svc} mysqldump "
         f"-u {shlex.quote(user)} --single-transaction --quick --triggers --events --routines "
         f"--hex-blob --default-character-set=utf8mb4 {shlex.quote(dbname)}",
         output_file=out_path,
@@ -1317,18 +1494,15 @@ def _backup_mysql_local(backend, db_dir):
 
     manifest_path = os.path.join(db_dir, "manifest.tsv")
     with open(manifest_path, "w") as mf:
-        mf.write(f"# pg_backup_manifest\tv4.1\tformat=tsv\tdb_type={backend['type']}\n")
+        mf.write(f"# pg_backup_manifest\tv4.2\tformat=tsv\tdb_type={backend['type']}\n")
         mf.write(f"{dbname}\t{user}\t0\t{sql_file}\t\n")
     print_success(f"Wrote manifest for {backend['type']} database '{dbname}'.")
     return True
 
 def _backup_sqlite_local(backend, db_dir):
-    """Copy the SQLite database file from /var/lib/pasarguard/ into db_dir.
-    The official panel uses one file, conventionally db.sqlite3."""
     candidates = []
     if backend.get("sqlite_path"):
         candidates.append(backend["sqlite_path"])
-    # Common defaults
     candidates += [
         os.path.join(PASARGUARD_DATA_DIR, "db.sqlite3"),
         os.path.join(PASARGUARD_DATA_DIR, "db.sqlite"),
@@ -1344,17 +1518,13 @@ def _backup_sqlite_local(backend, db_dir):
 
     manifest_path = os.path.join(db_dir, "manifest.tsv")
     with open(manifest_path, "w") as mf:
-        mf.write("# pg_backup_manifest\tv4.1\tformat=tsv\tdb_type=sqlite\n")
+        mf.write("# pg_backup_manifest\tv4.2\tformat=tsv\tdb_type=sqlite\n")
         mf.write(f"{os.path.splitext(dst_name)[0]}\tpasarguard\t0\t{dst_name}\t\n")
     print_success("Wrote manifest for SQLite database.")
     return True
 
 # ── Workflow 1: Transfer to new server ───────────────────────
 def _read_manifest(db_dir):
-    """Read the manifest.tsv and return (db_type, entries).
-    `entries` is a list of (db, sql_file, has_ts, ts_version) tuples.
-    Tolerates the v4.1 header format, the v4.0 header format, and the
-    legacy v3.3 single-row format (no header)."""
     manifest_path = os.path.join(db_dir, "manifest.tsv")
     if not os.path.exists(manifest_path):
         return None, []
@@ -1364,7 +1534,6 @@ def _read_manifest(db_dir):
         for raw in f:
             line = raw.rstrip("\n")
             if not line.strip() or line.lstrip().startswith("#"):
-                # v4.1 header line: # pg_backup_manifest\tv4.1\tformat=tsv\tdb_type=postgresql
                 if "db_type=" in line:
                     for part in line.split():
                         if part.startswith("db_type="):
@@ -1380,7 +1549,6 @@ def _read_manifest(db_dir):
             if db and sql_file:
                 entries.append((db, sql_file, has_ts, ts_ver))
     if not db_type:
-        # Heuristic: if entries mention .sqlite → sqlite; if globals.sql present → postgres/timescaledb
         if any(f.endswith(".sqlite3") or f.endswith(".sqlite") or f == "db_backup.sqlite" for _, f, _, _ in entries):
             db_type = "sqlite"
         elif os.path.exists(os.path.join(db_dir, "globals.sql")):
@@ -1426,7 +1594,6 @@ def _restore_databases_local(db_dir, local_db_svc, backend_type=None):
 
 # ── PostgreSQL / TimescaleDB remote restore ───────────────────
 def _restore_postgres_remote(ssh, db_dir, svc, entries):
-    # Restore globals once
     print_info("Restoring globals.sql (roles / tablespaces / shared grants)...")
     if not execute_ssh_command(
         ssh,
@@ -1470,7 +1637,7 @@ def _restore_postgres_remote(ssh, db_dir, svc, entries):
 def _restore_postgres_local(db_dir, svc, entries):
     print_info("Restoring globals.sql (roles / tablespaces / shared grants)...")
     if not run_command(
-        f"cd {PASARGUARD_DIR} && cat {db_dir}/globals.sql | "
+        f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/globals.sql | "
         f"docker compose exec -T {svc} psql -U pasarguard -d postgres"
     ):
         print_error("Failed to restore globals.sql")
@@ -1491,7 +1658,7 @@ def _restore_postgres_local(db_dir, svc, entries):
             return False
         print_info(f"Restoring {sql_file} → {db}  (may take a while)...")
         if not run_command(
-            f"cd {PASARGUARD_DIR} && cat {db_dir}/{sql_file} | "
+            f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
             f"docker compose exec -T {svc} psql -U pasarguard -d {shlex.quote(db)}"
         ):
             print_error(f"Failed to restore {sql_file}")
@@ -1502,9 +1669,6 @@ def _restore_postgres_local(db_dir, svc, entries):
 def _restore_mysql_remote(ssh, db_dir, svc, entries):
     for db, sql_file, _, _ in entries:
         print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
-        # The official script tries four credential fallbacks; for the simple
-        # case we read MYSQL_ROOT_PASSWORD / DB_PASSWORD from the restored
-        # .env (it's already on the remote host in /opt/pasarguard/.env).
         ec, env_text, _ = ssh_shell(ssh, f"grep -E '^(DB_PASSWORD|MYSQL_ROOT_PASSWORD|DB_USER|DB_NAME)=' {PASARGUARD_DIR}/.env")
         env_lines = {}
         for ln in env_text.splitlines():
@@ -1515,7 +1679,6 @@ def _restore_mysql_remote(ssh, db_dir, svc, entries):
         user_pwd = env_lines.get("DB_PASSWORD", "")
         user     = env_lines.get("DB_USER", "root")
 
-        # Prefer the app user (least privilege), fall back to root
         candidates = []
         if user and user_pwd:
             candidates.append((user, user_pwd))
@@ -1524,10 +1687,12 @@ def _restore_mysql_remote(ssh, db_dir, svc, entries):
 
         restored = False
         for cred_user, cred_pwd in candidates:
-            env_prefix = f"MYSQL_PWD={shlex.quote(cred_pwd)}" if cred_pwd else ""
+            # v4.2 fix: MYSQL_PWD passed via `docker compose exec -e`, not
+            # the SSH shell's own environment (which the container never sees).
+            env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
             cmd = (
                 f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-                f"{env_prefix} docker compose exec -T {svc} mysql -u {shlex.quote(cred_user)}"
+                f"docker compose exec -T {env_flag}{svc} mysql -u {shlex.quote(cred_user)}"
             )
             ec2, _, _ = ssh_shell(ssh, cmd)
             if ec2 == 0:
@@ -1556,10 +1721,11 @@ def _restore_mysql_local(db_dir, svc, entries):
         print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
         restored = False
         for cred_user, cred_pwd in candidates:
-            env_prefix = f"MYSQL_PWD={shlex.quote(cred_pwd)}" if cred_pwd else ""
+            # v4.2 fix: same MYSQL_PWD-via-exec-e fix as the remote path.
+            env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
             cmd = (
-                f"cd {PASARGUARD_DIR} && cat {db_dir}/{sql_file} | "
-                f"{env_prefix} docker compose exec -T {svc} mysql -u {shlex.quote(cred_user)}"
+                f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
+                f"docker compose exec -T {env_flag}{svc} mysql -u {shlex.quote(cred_user)}"
             )
             if run_command(cmd, quiet=True):
                 print_success(f"Restored using credentials for user '{cred_user}'.")
@@ -1573,7 +1739,6 @@ def _restore_mysql_local(db_dir, svc, entries):
 # ── SQLite remote restore ─────────────────────────────────────
 def _restore_sqlite_remote(ssh, db_dir, entries):
     for db, sql_file, _, _ in entries:
-        # Find where the live sqlite file should land on the remote host
         ec, env_text, _ = ssh_shell(ssh, f"grep -E '^SQLALCHEMY_DATABASE_URL=' {PASARGUARD_DIR}/.env")
         target = "/var/lib/pasarguard/db.sqlite3"
         if "=" in env_text:
@@ -1582,7 +1747,6 @@ def _restore_sqlite_remote(ssh, db_dir, entries):
             if path and not path.startswith(":"):
                 target = "/" + path
         print_info(f"Restoring SQLite database → {target}")
-        # Stop the panel container, drop wal/shm, copy the new file, restart
         execute_ssh_command(ssh, "cd /opt/pasarguard && docker compose stop pasarguard", "Stopping panel", required=False)
         execute_ssh_command(ssh, f"rm -f {shlex.quote(target)} {shlex.quote(target)}-wal {shlex.quote(target)}-shm", "Removing old SQLite + WAL/SHM", required=False)
         if not execute_ssh_command(
@@ -1610,7 +1774,7 @@ def _restore_sqlite_local(db_dir, entries):
         run_command("cd /opt/pasarguard && docker compose stop pasarguard", quiet=True)
         run_command(f"rm -f {shlex.quote(target)} {shlex.quote(target)}-wal {shlex.quote(target)}-shm", quiet=True)
         if not run_command(
-            f"cp {db_dir}/{sql_file} {shlex.quote(target)} && chmod 0644 {shlex.quote(target)}"
+            f"cp {shlex.quote(os.path.join(db_dir, sql_file))} {shlex.quote(target)} && chmod 0644 {shlex.quote(target)}"
         ):
             print_error(f"Failed to restore SQLite file {sql_file}")
             return False
@@ -1635,7 +1799,7 @@ def workflow_transfer():
         print_info("Uploading to Telegram...")
         cap = (f"PasarGuard {'+ PG-Node ' if include_node else ''}Manual Transfer Backup\n"
                f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        success, details = send_telegram_file(bot_token, admin_id, zip_path, cap, proxy)
+        success, details = send_telegram_backup_archive(zip_path, cap, bot_token, admin_id, proxy)
         if success: print_success("Sent to Telegram!")
         else:       print_error(f"Telegram upload failed: {details}")
 
@@ -1646,11 +1810,19 @@ def workflow_transfer():
     if confirm != "y":
         print_error("Root access required. Aborting.")
         return
-    new_pass = input(f"  {C.R2}> Root Password: {C.RESET}").strip()
+    # v4.2: use getpass so the root password isn't echoed to the terminal
+    # or left sitting in shell/screen scrollback.
+    new_pass = getpass.getpass(f"  {C.R2}> Root Password: {C.RESET}").strip()
 
     print_info(f"Connecting to {new_ip}...")
     ssh = paramiko.SSHClient()
+    # NOTE: this still auto-accepts unknown host keys (no TOFU verification
+    # against a known_hosts file), which is inherently weak against a
+    # man-in-the-middle on first connect. We at least surface that clearly
+    # instead of doing it silently — see warning below.
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    print_warning("SSH host key will be trusted on first connect (no verification). "
+                  "Make sure you're on a trusted network.")
     try:
         ssh.connect(hostname=new_ip, username="root", password=new_pass, timeout=10)
         print_success("Connected!")
@@ -1677,15 +1849,13 @@ def workflow_transfer():
         zip_fn     = os.path.basename(zip_path)
         remote_zip = f"/opt/pasarguard/{zip_fn}"
         sftp.put(zip_path, remote_zip)
+        sftp.chmod(remote_zip, 0o600)
         sftp.close()
         print_success("Upload completed.")
 
-        execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {zip_fn}",
+        execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {shlex.quote(zip_fn)}",
                             "Extracting files")
 
-        # v4.1 — auto-detect the target server's database backend from the
-        # freshly extracted .env (works for sqlite, postgresql, timescaledb,
-        # mysql, mariadb).
         try:
             remote_backend = _detect_backend_ssh(ssh)
         except Exception as e:
@@ -1713,7 +1883,6 @@ def workflow_transfer():
                 "&& rm -rf /opt/pasarguard/pg_node_data",
                 "Restoring PG-Node data")
 
-        # SQLite: no DB container to start — restore the file and bring up the panel.
         if remote_backend["type"] == "sqlite":
             if not _restore_databases_remote(ssh, "db_dump", None, backend_type="sqlite"):
                 print_error("SQLite restore failed. Aborting.")
@@ -1766,9 +1935,6 @@ def workflow_transfer():
 
 # ── Workflow 2: Scheduled Telegram backup ────────────────────
 def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy=None, instance=None):
-    """The actual recurring backup+upload loop. Shared by the interactive
-    'None' persistence mode and the headless --daemon-backup entrypoint
-    (used by screen / tmux / systemd)."""
     interval_s  = int(interval_h * 3600)
     scope_label = "PasarGuard + PG-Node" if include_node else "PasarGuard only"
     print_info(f"Scheduler started  scope: {C.BOLD}{scope_label}{C.RESET}  every {interval_h}h")
@@ -1786,7 +1952,7 @@ def run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, pro
                 print_info("Uploading to Telegram...")
                 cap = (f"PasarGuard {'+ PG-Node ' if include_node else ''}Auto Backup\n"
                        f"Date: {now_str}\nInterval: {interval_h}h")
-                success, details = send_telegram_file(bot_token, admin_id, zip_path, cap, proxy)
+                success, details = send_telegram_backup_archive(zip_path, cap, bot_token, admin_id, proxy)
                 if success: print_success("Backup sent to Telegram!")
                 else:       print_error(f"Send failed: {details}")
                 try:
@@ -1827,25 +1993,25 @@ def workflow_backup_bot():
         print_warning("Invalid number. Defaulting to 1.0 hour.")
         interval_h = 1.0
 
-    # Ask HOW the scheduler should survive after this SSH session ends,
-    # before the token/chat-id are used to actually start anything.
     mode = ask_persistence_mode()
 
     if mode == "1":
-        # Runs in the foreground of the current shell — will die with the SSH session.
         run_scheduled_backup_loop(bot_token, admin_id, interval_h, include_node, proxy)
         return
 
     kind_by_mode = {"2": "screen", "3": "tmux", "4": "systemd"}
     kind = kind_by_mode[mode]
 
-    # Pick the instance name BEFORE building the daemon command, so the
-    # child process knows its own name and can report its status (backing
-    # up / sleeping) back to the 'Manage Backup Schedulers' menu, and so
-    # several instances (e.g. -1, -2) can run side by side without clashing.
     instance_name = ask_instance_name(kind)
-    daemon_cmd = build_daemon_command(bot_token, admin_id, interval_h, include_node, proxy,
-                                       instance=instance_name)
+
+    # v4.2: token/chat/proxy go to a 0600 credentials file instead of into
+    # the daemon's CLI args (which would otherwise leak via `ps`,
+    # /proc/<pid>/cmdline, and the systemd unit file). interval/include_node
+    # are stored alongside them so 'Manage Backup Schedulers' can later
+    # restart this exact instance or update its token without re-asking.
+    write_daemon_creds(instance_name, bot_token, admin_id, proxy,
+                        interval_h=interval_h, include_node=include_node)
+    daemon_cmd = build_daemon_command(interval_h, include_node, instance=instance_name)
 
     if mode == "2":
         launch_via_screen(daemon_cmd, session_name=instance_name)
@@ -1866,6 +2032,19 @@ def workflow_manual_backup():
         print_error("Manual backup failed!")
 
 # ── Workflow 4: Manual local restore ─────────────────────────
+_SAFE_FILENAME_RE = None
+
+def _is_safe_filename(name):
+    """v4.2: validate the user-supplied backup filename before it ever
+    touches a shell=True command. Only allow a plain filename (letters,
+    digits, dot, dash, underscore) with no path separators — blocks both
+    shell metacharacter injection and path traversal (../../etc)."""
+    import re
+    global _SAFE_FILENAME_RE
+    if _SAFE_FILENAME_RE is None:
+        _SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+    return bool(name) and "/" not in name and ".." not in name and bool(_SAFE_FILENAME_RE.match(name))
+
 def workflow_manual_restore():
     print_header("Manual Restore (Local)")
 
@@ -1876,7 +2055,19 @@ def workflow_manual_restore():
     zip_name = input(
         f"  {C.R2}> Backup ZIP filename (e.g. backup_full_20260101.zip): {C.RESET}"
     ).strip()
-    if not os.path.exists(zip_name):
+
+    # v4.2 — SECURITY FIX: this filename used to be interpolated directly
+    # into a `shell=True` unzip command with no quoting/validation, which
+    # allowed arbitrary shell command injection (e.g. entering
+    # "x.zip; rm -rf /") to run as root. Validate it strictly before doing
+    # anything else with it.
+    if not _is_safe_filename(zip_name):
+        print_error("Invalid filename — only letters, digits, '.', '-', '_' are allowed "
+                     "(no paths, no shell characters).")
+        return
+
+    zip_name = _join_chunks_if_needed(zip_name)
+    if not zip_name or not _is_safe_filename(zip_name) or not os.path.exists(zip_name):
         print_error(f"File '{zip_name}' not found in current directory.")
         return
 
@@ -1900,7 +2091,8 @@ def workflow_manual_restore():
             return
 
         print_info("Extracting backup archive...")
-        if not run_command(f"unzip -q -o {zip_name} -d /opt/pasarguard"):
+        # v4.2: zip_name is now validated + quoted.
+        if not run_command(f"unzip -q -o {shlex.quote(zip_name)} -d /opt/pasarguard"):
             print_error("Extraction failed.")
             return
 
@@ -1914,7 +2106,6 @@ def workflow_manual_restore():
             run_command("cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true")
             run_command("rm -rf /opt/pasarguard/pg_node_opt /opt/pasarguard/pg_node_data")
 
-        # v4.1 — auto-detect the actual backend type from the freshly extracted .env
         try:
             backend = _detect_backend_local()
         except Exception as e:
@@ -1927,7 +2118,6 @@ def workflow_manual_restore():
             f"db={backend['dbname']}  container={backend['container'] or '(none — sqlite)'}"
         )
 
-        # SQLite: no DB container to start — just restore the file and bring the panel up.
         if backend["type"] == "sqlite":
             if not _restore_databases_local("db_dump", None, backend_type="sqlite"):
                 raise Exception("SQLite restore failed.")
@@ -1964,15 +2154,10 @@ def workflow_manual_restore():
         print_warning("System may be in a partially restored state.")
 
 # ── Workflow 5: Manage running/installed schedulers ───────────
-# Lets a non-technical user see every scheduler instance (systemd/screen/tmux)
-# that keeps running after SSH disconnects, and safely restart/stop/remove it
-# — without having to touch systemctl/screen/tmux commands by hand.
 def _systemctl_action(unit_name, action, quiet=False):
     return run_command(f"systemctl {action} {unit_name}.service", quiet=quiet)
 
 def _format_remaining(target_str):
-    """Turn a 'YYYY-mm-dd HH:MM:SS' target into a short remaining-time label
-    like '50m', '1h', '1h 20m', or 'now' if it's already due/passed."""
     try:
         target = datetime.datetime.strptime(target_str, "%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -1993,7 +2178,7 @@ def _format_remaining(target_str):
 def workflow_manage_schedulers():
     print_header("Manage Backup Schedulers")
 
-    items = []  # (kind, name, active)
+    items = []
     for suffix, name, active in list_systemd_backup_units():
         items.append(("systemd", name, active))
     for name in list_screen_sessions():
@@ -2035,22 +2220,16 @@ def workflow_manage_schedulers():
         return
 
     print()
-    print(f"  {C.R1}1{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Restart{C.RESET}")
+    print(f"  {C.R1}1{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Restart (pick up latest script update){C.RESET}")
     print(f"  {C.R1}2{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Stop{C.RESET}")
     print(f"  {C.R1}3{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Remove completely{C.RESET}")
-    print(f"  {C.R1}4{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Cancel{C.RESET}")
+    print(f"  {C.R1}4{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Update Bot Token / Admin Chat ID{C.RESET}")
+    print(f"  {C.R1}5{C.RESET}  {C.R3}-{C.RESET}  {C.WH}Cancel{C.RESET}")
     print()
-    act = input(f"  {C.R2}> Choose action for '{name}' (1-4): {C.RESET}").strip()
+    act = input(f"  {C.R2}> Choose action for '{name}' (1-5): {C.RESET}").strip()
 
     if act == "1":
-        if kind == "systemd":
-            if _systemctl_action(name, "restart"):
-                print_success(f"'{name}' restarted.")
-            else:
-                print_error(f"Failed to restart '{name}'.")
-        else:
-            print_warning(f"{kind} sessions can't be restarted in place.")
-            print_info("Stop it and start a fresh scheduler instance instead.")
+        _restart_scheduler_instance(kind, name)
 
     elif act == "2":
         if kind == "systemd":
@@ -2084,17 +2263,114 @@ def workflow_manage_schedulers():
                 if os.path.exists(unit_path):
                     os.remove(unit_path)
                 run_command("systemctl daemon-reload", quiet=True)
+                # Clean up the credentials file too, since it holds the bot token.
+                creds_path = _creds_path(name)
+                if os.path.exists(creds_path):
+                    os.remove(creds_path)
                 print_success(f"Removed systemd scheduler '{name}'.")
             except Exception as e:
                 print_error(f"Failed to remove unit file: {e}")
         elif kind == "screen":
             run_command(f"screen -S {name} -X quit", quiet=True)
+            creds_path = _creds_path(name)
+            if os.path.exists(creds_path):
+                try: os.remove(creds_path)
+                except Exception: pass
             print_success(f"Removed screen scheduler '{name}'.")
         elif kind == "tmux":
             run_command(f"tmux kill-session -t {name}", quiet=True)
+            creds_path = _creds_path(name)
+            if os.path.exists(creds_path):
+                try: os.remove(creds_path)
+                except Exception: pass
             print_success(f"Removed tmux scheduler '{name}'.")
+
+    elif act == "4":
+        _update_scheduler_credentials(kind, name)
+
     else:
         print_warning("Cancelled.")
+
+def _restart_scheduler_instance(kind, name):
+    """Restart a scheduler instance so it picks up the latest code from
+    'Update to Latest Version', without deleting and recreating it.
+
+    - systemd: ExecStart already points at the on-disk script path, so a
+      plain `systemctl restart` re-execs the process against whatever code
+      is currently on disk — that alone is enough to pick up an update.
+    - screen/tmux: the running process is a live Python interpreter that
+      already loaded the old code into memory, so a restart has to kill the
+      session and spawn a fresh one. We rebuild the exact daemon command
+      from the stored credentials/meta file (token/chat/proxy/interval/
+      scope) so the user doesn't have to re-enter anything."""
+    if kind == "systemd":
+        if _systemctl_action(name, "restart"):
+            print_success(f"'{name}' restarted and is now running the latest script version.")
+        else:
+            print_error(f"Failed to restart '{name}'.")
+        return
+
+    meta = read_daemon_meta(name)
+    if not meta:
+        print_error(f"No stored credentials/config found for '{name}' — cannot rebuild it.")
+        print_info("Remove it and create a fresh scheduler instance instead.")
+        return
+
+    daemon_cmd = build_daemon_command(meta["interval"], meta["node"], instance=name)
+
+    if kind == "screen":
+        run_command(f"screen -S {name} -X quit", quiet=True)
+        if run_command(f"screen -dmS {name} {daemon_cmd}"):
+            print_success(f"'{name}' restarted in a fresh screen session — now running the latest script version.")
+        else:
+            print_error(f"Failed to restart screen session '{name}'.")
+    elif kind == "tmux":
+        run_command(f"tmux kill-session -t {name}", quiet=True)
+        if run_command(f"tmux new-session -d -s {name} {daemon_cmd}"):
+            print_success(f"'{name}' restarted in a fresh tmux session — now running the latest script version.")
+        else:
+            print_error(f"Failed to restart tmux session '{name}'.")
+
+def _update_scheduler_credentials(kind, name):
+    """Let the user change a running scheduler's bot token and/or admin
+    chat ID without deleting and recreating the whole instance. Updates the
+    0600 credentials file, then restarts the instance so the change takes
+    effect immediately (same restart logic as option 1)."""
+    meta = read_daemon_meta(name)
+    if not meta:
+        print_error(f"No stored credentials found for '{name}' — cannot update it.")
+        print_info("This can happen for a scheduler created by an older script version.")
+        print_info("Remove it and create a fresh scheduler instance instead.")
+        return
+
+    print()
+    print_info(f"Current admin chat ID: {meta['chat']}")
+    print_info(f"Current bot token: {_mask_secret(meta['token'])}")
+    print()
+
+    new_token = input(f"  {C.R2}> New Bot Token (ENTER to keep current): {C.RESET}").strip()
+    new_chat  = input(f"  {C.R2}> New Admin Chat ID (ENTER to keep current): {C.RESET}").strip()
+
+    if new_chat and not new_chat.lstrip("-").isdigit():
+        print_error("Admin Chat ID must be numeric. Aborted — nothing changed.")
+        return
+
+    if not new_token and not new_chat:
+        print_warning("Nothing entered — no changes made.")
+        return
+
+    write_daemon_creds(
+        name,
+        bot_token=new_token or None,
+        admin_id=new_chat or None,
+        proxy=meta["proxy"],
+        interval_h=meta["interval"],
+        include_node=meta["node"],
+    )
+    print_success(f"Credentials updated for '{name}'.")
+
+    print_info("Restarting so the new credentials take effect...")
+    _restart_scheduler_instance(kind, name)
 
 # ── Workflow 6: Update to latest version ──────────────────────
 UPDATE_CMD = 'sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/install.sh)"'
@@ -2131,14 +2407,36 @@ def workflow_update():
 def run_daemon_from_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--daemon-backup", action="store_true")
-    parser.add_argument("--token", required=True)
-    parser.add_argument("--chat", required=True)
+    # v4.2: --token/--chat/--proxy are no longer accepted here (they used to
+    # leak via `ps`/systemd unit files). Credentials are now read from a
+    # 0600 file keyed by --instance. Old flags are still parsed (accepted
+    # but ignored with a warning) so a stale unit file from v4.1 doesn't
+    # hard-crash — but it also won't leak a working token either.
+    parser.add_argument("--token", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--chat", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--proxy", default=None)
     parser.add_argument("--interval", type=float, required=True)
     parser.add_argument("--node", action="store_true")
-    parser.add_argument("--proxy", default=None)
-    parser.add_argument("--instance", default=None)
+    parser.add_argument("--instance", default="default")
     args = parser.parse_args()
-    run_scheduled_backup_loop(args.token, args.chat, args.interval, args.node, args.proxy, args.instance)
+
+    if args.token or args.chat:
+        sys.stderr.write(
+            "[pg-backup] --token/--chat CLI args are no longer supported for security "
+            "reasons; re-create this scheduler from the menu so credentials are stored "
+            "in a 0600 file instead.\n"
+        )
+        sys.exit(1)
+
+    try:
+        token, chat, proxy = read_daemon_creds(args.instance)
+    except FileNotFoundError:
+        sys.stderr.write(f"[pg-backup] No credentials file found for instance '{args.instance}' "
+                          f"in {CREDS_DIR}. Re-create the scheduler from the menu.\n")
+        sys.exit(1)
+
+    proxy = args.proxy or proxy
+    run_scheduled_backup_loop(token, chat, args.interval, args.node, proxy, args.instance)
 
 # ── Main menu ─────────────────────────────────────────────────
 MENU = [
@@ -2194,7 +2492,6 @@ def main():
 
 if __name__ == "__main__":
     if "--daemon-backup" in sys.argv:
-        # Re-invoked headlessly by screen / tmux / systemd — skip the interactive menu.
         run_daemon_from_args()
     else:
         main()
