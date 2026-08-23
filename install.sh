@@ -22,7 +22,20 @@ INSTALL_PATH="/usr/local/bin/PG-Backup"
 TMP_PATH="/tmp/pg_backup.py"
 
 DEVELOPER="CIAUB"
-VERSION_TAG="${1:-}"   # optional: pass a tag (e.g. v4.2.1) to pin that version
+VERSION_TAG="${1:-}"   # optional: pass a tag (e.g. v4.2.1 or 4.2.1) to pin that version
+
+# Accept version from both forms:
+#   bash install.sh 4.2.1        → $1 = 4.2.1
+#   bash -c "$(curl ...)" 4.2.1  → $0 = 4.2.1 (bash -c name slot)
+#   bash install.sh              → VERSION_TAG stays empty (latest from main)
+if [ -z "${VERSION_TAG}" ] && [[ "${0}" =~ ^[vV]?[0-9]+(\.[0-9]+){1,2}$ ]]; then
+  VERSION_TAG="${0}"
+fi
+
+# Normalize tag: prepend "v" if missing (GitHub tags use v-prefix)
+if [ -n "${VERSION_TAG}" ] && [[ ! "${VERSION_TAG}" =~ ^v ]]; then
+  VERSION_TAG="v${VERSION_TAG}"
+fi
 
 # ── Root check ────────────────────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
