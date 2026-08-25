@@ -27,6 +27,14 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 
 ---
 
+<div dir="rtl" align="center">
+
+[معرفی](#-معرفی) • [قابلیت‌ها](#-قابلیت‌ها) • [بک‌اندها](#️-بک‌اندهای-دیتابیس-پشتیبانی‌شده) • [نصب](#-نصب-و-اجرا) • [انتقال به سرور جدید](#-انتقال-به-سرور-جدید) • [بکاپ تلگرام](#-بکاپ-خودکار-تلگرام) • [تغییرات نسخه](#-تغییرات-نسخه) • [امنیت](#-امنیت-security)
+
+</div>
+
+---
+
 <div dir="rtl">
 
 # 🚀 معرفی
@@ -245,7 +253,7 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 | رمز MySQL/MariaDB | `MYSQL_PWD` به کانتینر forward نمی‌شد | `docker compose exec -e MYSQL_PWD=...` |
 | دایرکتوری موقت بکاپ | `/tmp` جهانی‌خواندنی | `tempfile.mkdtemp()` با `0700` |
 | آرشیو نهایی | chmod بعد از ساخت (race) | `umask 0077` + chmod 600 بلافاصله |
-| آپدیت خودکار | `curl | sudo bash` خام | دانلود → SHA256 → اجرا |
+| آپدیت خودکار | `curl \| sudo bash` خام | دانلود → SHA256 → اجرا |
 | نام Instance/سرویس | بدون validation در `shell=True` | regex سخت‌گیرانه + `shlex.quote()` |
 | MySQL data-dir مقصد | بین دو مهاجرت رمز عوض نمی‌شد → `1045` | تشخیص و پاک‌سازی bind mount/volume پیش از init |
 | مهاجرت با manifest ناقص | کشف خطا فقط بعد از پاک‌شدن سرور مقصد | بررسی محلی آرشیو پیش از هر عملیات مخرب |
