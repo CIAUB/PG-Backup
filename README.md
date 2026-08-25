@@ -6,7 +6,7 @@
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;All+5+Backends+Auto--Detected;Hardened+%26+Security--Audited" alt="Typing SVG" />
 
-![Version](https://img.shields.io/badge/Version-v4.2.1-8B0000)
+![Version](https://img.shields.io/badge/Version-v4.2.4-8B0000)
 ![Python](https://img.shields.io/badge/Python-3.8+-8B0000)
 ![Platform](https://img.shields.io/badge/Platform-Linux-8B0000)
 ![Docker](https://img.shields.io/badge/Docker-Supported-8B0000)
@@ -31,90 +31,66 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 
 # 🚀 معرفی
 
-**PG-Backup** یک ابزار حرفه‌ای برای تهیه نسخه پشتیبان، ریستور و مهاجرت سرویس‌های **PasarGuard** و **PG-Node** است.
+**PG-Backup** یک ابزار حرفه‌ای برای تهیه نسخه پشتیبان، ریستور و مهاجرت سرویس‌های **PasarGuard** و **PG-Node** است — با تشخیص خودکار بک‌اند، انتقال کامل بین سرورها، ارسال خودکار به تلگرام و بازیابی سریع.
 
-این ابزار با هدف ساده‌سازی مدیریت زیرساخت طراحی شده و امکان انتقال کامل سرویس‌ها بین سرورها، ارسال خودکار بکاپ به تلگرام و بازیابی سریع اطلاعات را فراهم می‌کند.
-
-> 🆕 **v4.2.1** — یک نسخه‌ی کاملاً **سخت‌گیرانه‌شده از نظر امنیتی**. کل مسیرهای backup/restore/scheduler در برابر command injection، path traversal (Zip-Slip)، نشت credential و race condition بازبینی و اصلاح شدند. جزئیات کامل در بخش [🔐 امنیت](#-امنیت-security) پایین‌تر.
+> 🆕 **v4.2.4** — رفع کامل خانواده‌ی خطای `manifest.tsv not found` در مهاجرت به سرور جدید (بررسی محلی آرشیو *قبل* از آپلود و پاک‌شدن سرور مقصد) + رفع ریشه‌ای خطای `1045 Access denied` روی MySQL/MariaDB (تشخیص و پاک‌سازی صحیح bind mount در برابر named volume، پیش از init مجدد). جزئیات در [📜 تغییرات نسخه](#-تغییرات-نسخه) و [🔐 امنیت](#-امنیت-security).
 
 ---
 
 # ✨ قابلیت‌ها
 
-* 📦 بکاپ از PasarGuard
-* 📦 بکاپ کامل از PasarGuard + PG-Node
-* 🔄 ریستور کامل از فایل ZIP
-* 🚀 انتقال مستقیم به سرور جدید
-* 🤖 ارسال خودکار بکاپ به تلگرام (با تقسیم خودکار فایل‌های حجیم)
-* ⏰ بکاپ زمان‌بندی‌شده (چند شِدیولر هم‌زمان)
+* 📦 بکاپ PasarGuard تنها یا PasarGuard + PG-Node
 * 🗄️ بکاپ و ریستور **همه‌ی دیتابیس‌های پاسارگارد** (Multi-Database)
-* 🐳 مدیریت خودکار Docker Stack
-* ⚙️ نصب خودکار وابستگی‌ها
-* 🔐 انتقال امن از طریق SSH
-* 🎯 **تشخیص خودکار بک‌اند** دیتابیس (هیچ سؤالی از کاربر پرسیده نمی‌شود)
-* 🛡️ **سخت‌گیری امنیتی کامل**: بدون command injection، بدون Zip-Slip، بدون credential leak
+* 🎯 **تشخیص خودکار بک‌اند** دیتابیس — بدون سؤال از کاربر
+* 🚀 انتقال مستقیم و کامل به سرور جدید (Zero-Downtime Migration)
+* 🔄 ریستور کامل از فایل ZIP محلی
+* 🤖 ارسال خودکار بکاپ به تلگرام + تقسیم خودکار فایل‌های حجیم (>50MB)
+* ⏰ بکاپ زمان‌بندی‌شده با چند شِدیولر هم‌زمان (screen / tmux / systemd)
+* 🐳 مدیریت خودکار Docker Stack + نصب خودکار وابستگی‌ها
+* 🔐 انتقال امن از طریق SSH با رمز `getpass` (بدون echo)
+* 🛡️ سخت‌گیری امنیتی کامل: بدون command injection، بدون Zip-Slip، بدون credential leak
+* ✅ **بررسی سلامت آرشیو پیش از هر عملیات مخرب** (v4.2.4) — یک بکاپ ناقص هرگز باعث پاک‌شدن سرور مقصد یا نصب فعلی نمی‌شود
 
 ---
 
 # 🗄️ بک‌اندهای دیتابیس پشتیبانی‌شده
 
-ابزار به‌صورت **خودکار** نوع دیتابیس را از فایل `/opt/pasarguard/.env` و `docker-compose.yml` تشخیص می‌دهد — بدون هیچ سؤال یا تنظیم اضافی:
+نوع دیتابیس به‌صورت خودکار از `/opt/pasarguard/.env` و `docker-compose.yml` تشخیص داده می‌شود:
 
-| بک‌اند | ابزار بکاپ | ابزار ریستور |
+| بک‌اند | بکاپ | ریستور |
 | --- | --- | --- |
-| **SQLite** | کپی فایل `db.sqlite3` | کپی فایل با مسیر مقصد validate‌شده (با توقف موقت پنل) |
-| **PostgreSQL** | `pg_dump` + `pg_dumpall` (همه‌ی دیتابیس‌ها) | `psql` (per-database) |
-| **TimescaleDB** | `pg_dump` + `pg_dumpall` (با ثبت نسخه‌ی extension) | `psql` (per-database) |
-| **MySQL** | `mysqldump` (رمز از طریق `docker compose exec -e`) | `mysql` (با fallback خودکار credential) |
-| **MariaDB** | `mysqldump` (رمز از طریق `docker compose exec -e`) | `mysql` (با fallback خودکار credential) |
+| **SQLite** | کپی فایل `db.sqlite3` | کپی با مسیر مقصد validate‌شده |
+| **PostgreSQL** | `pg_dump` + `pg_dumpall` (همه‌ی DBها) | `psql` (per-database) |
+| **TimescaleDB** | مثل PostgreSQL + ثبت نسخه‌ی extension | `psql` (per-database) |
+| **MySQL / MariaDB** | `mysqldump --databases` (خودکفا، شامل `CREATE DATABASE`) | `mysql` با fallback خودکار چند credential |
 
-### فرآیند تشخیص (اتوماتیک)
+### فرآیند تشخیص
 
 ```text
-خواندن /opt/pasarguard/.env
-     │
-     ▼
-پارس SQLALCHEMY_DATABASE_URL
-     │
-     ▼
-اسکن docker-compose.yml
-(تشخیص timescaledb از postgres
- و mariadb از mysql با دیدن image)
-     │
-     ▼
-Validate کردن نام سرویس Docker
-(فقط [A-Za-z0-9_.-]+ پذیرفته می‌شود)
-     │
-     ▼
-انتخاب ابزار و کانتینر مناسب
-     │
-     ▼
-بکاپ / ریستور خودکار
+خواندن .env و پارس SQLALCHEMY_DATABASE_URL
+        │
+        ▼
+اسکن docker-compose.yml (تشخیص timescaledb از postgres، mariadb از mysql)
+        │
+        ▼
+Validate نام سرویس Docker  →  انتخاب ابزار و کانتینر مناسب
 ```
 
 ---
 
-# 🛠 نصب
-
-برای نصب PG-Backup کافی است دستور زیر را با دسترسی Root اجرا کنید:
+# 🛠 نصب و اجرا
 
 ```bash
 sudo bash -c "$(curl -sL https://raw.githubusercontent.com/CIAUB/PG-Backup/main/install.sh)"
 ```
 
-در صورتی که لینک اصلی در دسترس نبود:
+لینک جایگزین (در صورت عدم دسترسی):
 
 ```bash
 sudo bash -c "$(curl -sL https://raw.githack.com/CIAUB/PG-Backup/main/install.sh)"
 ```
 
-> 💡 لینک دوم از CDN جایگزین استفاده می‌کند و در برخی شبکه‌ها پایداری بیشتری دارد.
-
----
-
-# 🚀 اجرا
-
-پس از نصب، برای باز کردن منوی ابزار کافی است دستور زیر را اجرا کنید:
+پس از نصب:
 
 ```bash
 PG-Backup
@@ -129,73 +105,42 @@ PG-Backup
 2 ─ 🤖 Auto Backup to Telegram Bot (Scheduled)
 3 ─ 💾 Manual Backup (Save Locally)
 4 ─ 🔄 Manual Restore (From Local ZIP)
-5 ─ 🧭 Manage Backup Schedulers (Start / Stop / Restart / Update Token)
+5 ─ 🧭 Manage Backup Schedulers
 6 ─ ⬆️ Update to Latest Version
 7 ─ 🚪 Exit
 ```
 
 ---
 
-# 📦 حالت‌های بکاپ
-
-### 1️⃣ PasarGuard Only
-
-```text
-/opt/pasarguard
-/var/lib/pasarguard
-All Pasarguard Databases (Multi-DB)
-  ├── globals.sql  (PG/TS only)
-  ├── db-001.sql
-  ├── db-002.sql
-  └── manifest.tsv
-```
-
-### 2️⃣ PasarGuard + PG-Node
-
-```text
-/opt/pasarguard
-/var/lib/pasarguard
-All Pasarguard Databases (Multi-DB)
-
-/opt/pg-node
-/var/lib/pg-node
-```
-
-> 💾 حین ساخته‌شدن بکاپ، محتویات موقت (شامل `.env` و دامپ خام دیتابیس) در یک دایرکتوری موقت **خصوصی (0700)** ساخته می‌شود، نه در `/tmp` عمومی. آرشیو نهایی `.zip` هم با دسترسی `0600` روی دیسک نوشته می‌شود.
-
----
-
 # 🚀 انتقال به سرور جدید
-
-این قابلیت برای مهاجرت کامل سرویس به سرور جدید طراحی شده است.
-
-### فرآیند انتقال
 
 ```text
 Detect Backend Auto
-     │
-     ▼
-Create Multi-DB Backup (0700 tmp dir)
-     │
-     ▼
-Send To Telegram (Optional)
-     │
-     ▼
-Connect To New Server (رمز با getpass، بدون echo)
-     │
-     ▼
-Upload Backup
-     │
-     ▼
-Validate Archive Locally (Zip-Slip check)
-     │
-     ▼
+        │
+        ▼
+Create Multi-DB Backup (tmp dir خصوصی 0700)
+        │
+        ▼
+✅ Verify Archive Locally — manifest.tsv معتبر است؟ (v4.2.4)
+   ✗ نامعتبر → توقف همین‌جا، هیچ سروری دست نمی‌خورد
+        │
+        ▼
+Send To Telegram (اختیاری)
+        │
+        ▼
+Connect To New Server (رمز با getpass)  →  Upload  →  Zip-Slip Validate
+        │
+        ▼
 Detect Target Backend Auto
-     │
-     ▼
-Restore Data (Per-Backend)
-     │
-     ▼
+        │
+        ▼
+اگر MySQL/MariaDB: تشخیص و پاک‌سازی صحیح data-dir
+(bind mount یا named volume) پیش از init مجدد کانتینر (v4.2.3)
+        │
+        ▼
+Restore Data (Per-Backend, با retry روی خواندن manifest ریموت)
+        │
+        ▼
 Start Services
 ```
 
@@ -203,111 +148,23 @@ Start Services
 
 ```text
 Server IP
-Root Password  (فقط با getpass گرفته می‌شود، هرگز echo/ذخیره نمی‌شود)
-Telegram Bot Token (Optional)
-Telegram Chat ID (Optional)
+Root Password  (فقط getpass، هرگز echo/ذخیره نمی‌شود)
+Telegram Bot Token / Chat ID (اختیاری)
 ```
 
-> ⚠️ **درباره‌ی SSH Host Key**: برای اولین اتصال به سرور جدید، کلید میزبان به‌صورت خودکار پذیرفته می‌شود (`AutoAddPolicy`) و یک هشدار صریح قبل از اتصال نمایش داده می‌شود. این یعنی روی شبکه‌های نامطمئن (Wi-Fi عمومی و…) امکان نظری حمله‌ی MITM در همان اولین اتصال وجود دارد. توصیه می‌شود این ابزار را فقط از شبکه‌های قابل‌اعتماد (VPN داخلی، دیتاسنتر) اجرا کنید.
+> ⚠️ اتصال SSH از `AutoAddPolicy` استفاده می‌کند (پذیرش خودکار کلید میزبان در اولین اتصال، با هشدار صریح). فقط از شبکه‌های قابل‌اعتماد اجرا کنید.
 
 ---
 
 # 🤖 بکاپ خودکار تلگرام
 
-امکان تهیه نسخه پشتیبان در بازه زمانی دلخواه و ارسال مستقیم به تلگرام.
+بازه‌های پشتیبانی‌شده: `30m` `1h` `6h` `12h` `24h`
 
-نمونه بازه‌ها:
+* فایل‌های >50MB به‌صورت خودکار به قطعات `.001` `.002` ... تقسیم می‌شوند و در Manual Restore به‌صورت خودکار شناسایی، verify و بازچسبانده می‌شوند.
+* ماندگاری شِدیولر بعد از بستن SSH: `None` / `screen` / `tmux` / `systemd`، هرکدام با یک نام نمونه (Instance Name) اعتبارسنجی‌شده.
+* توکن بات و Chat ID هرگز روی CLI یا unit فایل نیستند — در فایل `0600` جدا در `/etc/pasarguard-backup/<instance>.json` ذخیره می‌شوند.
 
-```text
-30 Minutes
-1 Hour
-6 Hours
-12 Hours
-24 Hours
-```
-
-### 📤 آپلود فایل‌های حجیم (>50MB)
-
-Telegram Bot API محدودیت ۵۰ مگابایتی روی هر فایل دارد. اگر آرشیو بکاپ از این حد بزرگ‌تر باشد:
-
-* به‌صورت خودکار به قطعات شماره‌دار (`.001`, `.002`, ...) تقسیم می‌شود
-* هر قطعه با کپشن راهنمای join مجدد ارسال می‌شود
-* در **Manual Restore**، قطعات موجود در دایرکتوری به‌صورت خودکار شناسایی، از نظر کامل‌بودن verify و بازچسبانده می‌شوند — بدون نیاز به `cat` دستی
-
-### ماندگاری بعد از بستن SSH
-
-هنگام تنظیم بکاپ زمان‌بندی‌شده، ابزار می‌پرسد که شِدیولر بعد از بسته‌شدن سشن SSH چطور زنده بماند:
-
-```text
-1 ─ None      (فقط تا وقتی همین ترمینال بازه)
-2 ─ screen    (سشن screen جدا در پس‌زمینه)
-3 ─ tmux      (سشن tmux جدا در پس‌زمینه)
-4 ─ systemd   (سرویس پس‌زمینه، حتی بعد از ری‌بوت هم زنده می‌مونه)
-```
-
-برای گزینه‌های ۲ تا ۴ یک **نام نمونه (Instance Name)** پرسیده می‌شود (مثلاً `pasarguard-backup-1`)، تا بشود چند شِدیولر را هم‌زمان و بدون قاطی‌شدن با هم اجرا کرد. نام به‌سختی اعتبارسنجی می‌شود (فقط حروف/عدد/`_`/`-`) تا از تزریق دستور یا path traversal جلوگیری شود.
-
-> 🔐 **توکن بات و Chat ID دیگر روی خط فرمان (CLI args) پاس داده نمی‌شوند** — چون این‌ها از طریق `ps`، `/proc/<pid>/cmdline` و فایل‌های systemd unit (که پیش‌فرض world-readable هستند) قابل خواندن بودند. از v4.2 به بعد، این اطلاعات در یک فایل **`0600`** در `/etc/pasarguard-backup/<instance>.json` ذخیره می‌شوند و پروسه‌ی daemon فقط با پرچم `--instance` آن‌ها را می‌خواند. شِدیولرهای ساخته‌شده با نسخه‌های قدیمی‌تر (که توکن را داخل unit file نگه می‌داشتند) به‌صورت خودکار به فرمت جدید مهاجرت می‌کنند.
-
----
-
-# 🧭 مدیریت شِدیولرها
-
-از منوی اصلی (گزینه ۵) می‌توان همه‌ی شِدیولرهای فعال یا نصب‌شده (systemd / screen / tmux) را مشاهده و مدیریت کرد:
-
-```text
-[systemd] pasarguard-backup-1   RUNNING   (sleeping — 50m until next backup)
-[systemd] pasarguard-backup-2   RUNNING   (backing up now)
-[screen ] pasarguard_backup-3   RUNNING
-```
-
-برای هر شِدیولر می‌توان:
-
-* 🔁 **Restart** — کد جدید را بدون حذف/بازسازی نمونه اعمال می‌کند (systemd صرفاً `restart`، screen/tmux با بازسازی session از روی credential ذخیره‌شده)
-* ⏹️ **Stop**
-* 🗑️ **Remove** — حذف کامل، شامل unit file و فایل credential
-* ✏️ **Update Bot Token / Admin Chat ID** — بدون نیاز به حذف و ساخت دوباره‌ی کل نمونه
-
----
-
-# 💾 بکاپ دستی
-
-نمونه فایل خروجی:
-
-```text
-backup_pg_20260801120000.zip
-```
-
-یا:
-
-```text
-backup_full_20260801120000.zip
-```
-
----
-
-# 🔄 ریستور دستی
-
-ریستور کامل از فایل ZIP شامل:
-
-* فایل‌های برنامه
-* تنظیمات
-* **تمام دیتابیس‌های پاسارگارد** (نه فقط یکی)
-* داده‌های PG-Node
-* داده‌های PasarGuard
-
-### مراحل ریستور
-
-```text
-Validate Filename (بدون path/shell metachar)
-Stop Containers
-Extract Archive (با بررسی Zip-Slip روی تک‌تک entryها)
-Restore Files
-Detect Backend From .env
-Restore Databases (Per-Backend, با اعتبارسنجی مسیر مقصد و نام فایل manifest)
-Start Containers
-Health Check
-```
+از منوی «مدیریت شِدیولرها» (گزینه ۵) می‌توان هر شِدیولر را **Restart** (بدون حذف/بازسازی)، **Stop**، **Remove** یا توکن/Chat ID آن را **Update** کرد.
 
 ---
 
@@ -320,20 +177,16 @@ backup_full_YYYYMMDDHHMMSS.zip
 ├── .env
 │
 ├── db_dump
-│   ├── globals.sql          (فقط برای PostgreSQL / TimescaleDB)
-│   ├── db-001.sql           (یا db.sqlite3 برای SQLite)
-│   ├── db-002.sql           (PG/TS multi-DB)
-│   ├── db-003.sql           (PG/TS multi-DB)
+│   ├── globals.sql        (فقط PostgreSQL / TimescaleDB)
+│   ├── db-001.sql         (یا db.sqlite3 برای SQLite)
+│   ├── db-002.sql         (Multi-DB)
 │   └── manifest.tsv
 │       # pg_backup_manifest  v4.2  format=tsv  db_type=timescaledb
 │       pasarguard  pasarguard  1  db-001.sql  2.17.2
 │       analytics   pasarguard  0  db-002.sql
-│       node_panel  pasarguard  0  db-003.sql
 │
 ├── pasarguard_data
-│
 ├── pg_node_opt
-│
 └── pg_node_data
 ```
 
@@ -341,68 +194,73 @@ backup_full_YYYYMMDDHHMMSS.zip
 
 # 📂 مسیرهای پیش‌فرض
 
-| سرویس      | مسیر کانفیگ       | مسیر داده             |
-| ---------- | ----------------- | --------------------- |
+| سرویس | کانفیگ | داده |
+| --- | --- | --- |
 | PasarGuard | `/opt/pasarguard` | `/var/lib/pasarguard` |
-| PG-Node    | `/opt/pg-node`    | `/var/lib/pg-node`    |
+| PG-Node | `/opt/pg-node` | `/var/lib/pg-node` |
 
 ---
 
 # ⬆️ آپدیت به آخرین نسخه
 
-از منوی اصلی (گزینه ۶) می‌توان مستقیم از داخل ابزار به آخرین نسخه آپدیت کرد. برخلاف نصب اولیه، این فرآیند دیگر یک `curl | sudo bash` خام نیست:
+از منوی اصلی (گزینه ۶):
 
 ```text
-Download install.sh   →   دایرکتوری موقت خصوصی (0700)
-     │
-     ▼
-Download install.sh.sha256  (در صورت موجود بودن)
-     │
-     ▼
-مقایسه SHA256  →  در صورت عدم تطابق: توقف کامل
-     │
-     ▼
+Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
+        │
+        ▼
+مقایسه SHA256  →  عدم تطابق: توقف کامل
+        │
+        ▼
 اجرای فایل ذخیره‌شده با sudo bash
 ```
 
-اگر فایل هش در دسترس نباشد، ابزار صراحتاً هشدار می‌دهد و تأیید دستی کاربر را برای ادامه‌ی بدون verification می‌خواهد.
+اگر هش در دسترس نباشد، تأیید دستی کاربر برای ادامه‌ی بدون verification لازم است.
 
-> 💡 شِدیولرهایی که از قبل در حال اجرا هستند (screen/tmux/systemd) کد نسخه‌ی قبلی را در حافظه دارند؛ بعد از آپدیت، از منوی «مدیریت شِدیولرها» آن‌ها را Restart کنید تا نسخه‌ی جدید فعال شود.
+> 💡 بعد از آپدیت، شِدیولرهای در حال اجرا را از «مدیریت شِدیولرها» Restart کنید تا کد جدید فعال شود.
+
+---
+
+# 📜 تغییرات نسخه
+
+آخرین تغییرات مهم:
+
+* **v4.2.4** — رفع ریشه‌ای «manifest.tsv not found» در مهاجرت: آرشیو بکاپ پیش از هر عملیات مخرب به‌صورت محلی اعتبارسنجی می‌شود.
+* **v4.2.3** — رفع `1045 Access denied` در ریستور MySQL/MariaDB با تشخیص و پاک‌سازی صحیح data-dir مقصد.
+* **v4.2.2** — رفع خواندن manifest از سرور ریموت + انتظار آماده‌شدن دیتابیس بر اساس نوع بک‌اند.
+
+تاریخچه‌ی کامل هر نسخه (از v4.0 تا امروز) در **[CHANGELOG.md](CHANGELOG.md)**.
 
 ---
 
 # 🔐 امنیت (Security)
 
-نسخه‌ی v4.2.1 حاصل یک ممیزی کامل امنیتی روی کل مسیرهای اجرای shell، فایل‌سیستم و شبکه است. مهم‌ترین اصلاحات:
-
 | حوزه | مشکل قبلی | راه‌حل |
 | --- | --- | --- |
-| **Manual Restore** | نام فایل ZIP بدون escape داخل دستور `shell=True` قرار می‌گرفت (Command Injection) | اعتبارسنجی سخت‌گیرانه‌ی نام فایل (`[A-Za-z0-9_.-]+`) قبل از هر استفاده |
-| **استخراج آرشیو** | `unzip -o` به entryهایی مثل `../../etc/cron.d/evil` اجازه‌ی نوشتن می‌داد (Zip-Slip) | استخراج با ماژول `zipfile` پایتون + بررسی صریح مسیر هر entry و رد symlinkهای مشکوک |
-| **ریستور SQLite** | مسیر مقصد از `SQLALCHEMY_DATABASE_URL` داخل بکاپ خوانده می‌شد؛ یک بکاپ مخرب می‌توانست فایل دلخواهی را overwrite کند | مسیر مقصد با `realpath` باید حتماً زیرمجموعه‌ی `/var/lib/pasarguard/` باشد |
-| **manifest.tsv** | نام فایل SQL داخل manifest بدون بررسی traversal استفاده می‌شد | رد هر مقداری که شامل `..`، `/` یا `\` باشد |
-| **توکن/چت‌آیدی تلگرام** | به‌صورت plaintext در CLI args و systemd unit فایل‌ها (world-readable) قرار می‌گرفت | ذخیره در فایل `0600` جدا؛ daemon فقط با `--instance` می‌خواند |
-| **رمز MySQL/MariaDB** | `MYSQL_PWD` روی پروسه‌ی هاست ست می‌شد ولی توسط `docker compose exec` به کانتینر forward نمی‌شد | ارسال با `docker compose exec -e MYSQL_PWD=...` مستقیم به کانتینر |
-| **دایرکتوری موقت بکاپ** | `/tmp/<name>` با دسترسی جهانی‌خواندنی، حاوی `.env` و دامپ خام دیتابیس | `tempfile.mkdtemp()` با دسترسی `0700` |
-| **آرشیو نهایی** | ساخته می‌شد و بعداً `chmod` می‌شد (پنجره‌ی race) | `umask 0077` قبل از ساخت آرشیو + chmod 600 بلافاصله |
-| **آپدیت خودکار** | `curl | sudo bash` — payload آلوده مستقیم وارد یک shell روت می‌شد | دانلود → تأیید SHA256 → اجرا از فایل ذخیره‌شده |
-| **نام Instance/سرویس Docker** | مسیر فایل، نام unit systemd، نام session screen/tmux و دستورات shell از ورودی کاربر یا `docker-compose.yml` ساخته می‌شدند بدون validation | اعتبارسنجی سخت‌گیرانه (regex) + `shlex.quote()` در همه‌ی نقاط `shell=True` |
-| **وضعیت شِدیولرها** | فایل‌های state در `/tmp` نگهداری می‌شدند | انتقال به `/etc/pasarguard-backup/state/` با دسترسی `0700` |
+| Manual Restore | نام فایل ZIP بدون escape (Command Injection) | اعتبارسنجی سخت‌گیرانه‌ی نام فایل |
+| استخراج آرشیو | `unzip -o` به Zip-Slip اجازه می‌داد | استخراج با `zipfile` + بررسی مسیر هر entry |
+| ریستور SQLite | مسیر مقصد از بکاپ خوانده می‌شد (overwrite دلخواه) | `realpath` محدود به `/var/lib/pasarguard/` |
+| manifest.tsv | نام فایل SQL بدون بررسی traversal | رد هر مقدار شامل `..`, `/`, `\` |
+| توکن/چت‌آیدی تلگرام | plaintext در CLI/unit فایل (world-readable) | فایل `0600` جدا؛ خواندن فقط با `--instance` |
+| رمز MySQL/MariaDB | `MYSQL_PWD` به کانتینر forward نمی‌شد | `docker compose exec -e MYSQL_PWD=...` |
+| دایرکتوری موقت بکاپ | `/tmp` جهانی‌خواندنی | `tempfile.mkdtemp()` با `0700` |
+| آرشیو نهایی | chmod بعد از ساخت (race) | `umask 0077` + chmod 600 بلافاصله |
+| آپدیت خودکار | `curl | sudo bash` خام | دانلود → SHA256 → اجرا |
+| نام Instance/سرویس | بدون validation در `shell=True` | regex سخت‌گیرانه + `shlex.quote()` |
+| MySQL data-dir مقصد | بین دو مهاجرت رمز عوض نمی‌شد → `1045` | تشخیص و پاک‌سازی bind mount/volume پیش از init |
+| مهاجرت با manifest ناقص | کشف خطا فقط بعد از پاک‌شدن سرور مقصد | بررسی محلی آرشیو پیش از هر عملیات مخرب |
 
-### ⚠️ نکته‌ی باز (به عهده‌ی کاربر)
-
-اتصال SSH در «Auto Backup & Transfer to New Server» از `AutoAddPolicy` استفاده می‌کند — یعنی کلید میزبان سرور جدید در اولین اتصال بدون تأیید پذیرفته می‌شود (با نمایش هشدار صریح). این ریسک تئوریک MITM را روی شبکه‌های نامطمئن باز نگه می‌دارد. توصیه: این ابزار را فقط از شبکه‌های قابل‌اعتماد اجرا کنید، یا کلید میزبان را از قبل به‌صورت دستی verify کنید.
+> ⚠️ **نکته‌ی باز**: اتصال SSH از `AutoAddPolicy` استفاده می‌کند (پذیرش خودکار کلید میزبان، با هشدار صریح) — ریسک تئوریک MITM روی شبکه‌های نامطمئن. توصیه: فقط از شبکه‌های قابل‌اعتماد اجرا کنید یا کلید میزبان را از قبل دستی verify کنید.
 
 ---
 
 # ⚠️ نکات مهم
 
-* اجرای ابزار نیازمند دسترسی Root است.
-* هنگام ریستور سرویس‌ها به‌صورت موقت متوقف می‌شوند.
-* اطلاعات ورود SSH ذخیره نمی‌شوند و رمز عبور با `getpass` (بدون echo) گرفته می‌شود.
-* فایل‌های بکاپ شامل اطلاعات حساس هستند و با دسترسی `0600` ذخیره می‌شوند — همچنان توصیه می‌شود در محل امن نگهداری شوند.
-* **رمزهای عبور (DB_PASSWORD و غیره) در خروجی ابزار به‌صورت `****XXXX` نمایش داده می‌شوند.**
-* توکن بات تلگرام و Chat ID در فایل‌های `0600` جدا از دستورات اجرا نگه‌داری می‌شوند، نه در CLI/unit fileهای world-readable.
+* اجرا نیازمند دسترسی Root است؛ هنگام ریستور سرویس‌ها موقتاً متوقف می‌شوند.
+* اطلاعات SSH ذخیره نمی‌شوند؛ رمز با `getpass` گرفته می‌شود.
+* فایل‌های بکاپ حاوی اطلاعات حساس‌اند و با `0600` ذخیره می‌شوند — در محل امن نگه دارید.
+* رمزهای عبور در خروجی ابزار به‌صورت `****XXXX` نمایش داده می‌شوند.
+* توکن بات و Chat ID همیشه در فایل `0600` جدا هستند، نه در CLI/unit فایل.
 
 ---
 
@@ -415,7 +273,6 @@ Download install.sh.sha256  (در صورت موجود بودن)
 # 📞 ارتباط با توسعه‌دهنده
 
 * 👨‍💻 Telegram: https://t.me/CIAUB
-
 * 🐙 GitHub: https://github.com/CIAUB
 
 ---
