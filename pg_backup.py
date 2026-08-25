@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v4.2.1
+#   Pasarguard Backup Utility  v4.2.4
 #   Dev by: CIA
 #   GitHub: https://github.com/CIAUB
 #   v4.0 — multi-database support: backs up & restores EVERY Pasarguard DB
@@ -33,6 +33,21 @@
 #            picks up the latest script code without deleting and
 #            recreating it, and can update a running scheduler's bot
 #            token / admin chat ID in place.
+#   v4.2.4 — 'manifest.tsv not found or empty' fail-fast pass:
+#          * new archive backup with no usable manifest.tsv is now caught
+#            LOCALLY right after it's created — in both Auto Transfer and
+#            Manual Restore — before any destination/local containers are
+#            stopped or directories wiped. Previously this failure was only
+#            discovered after a full upload + destination wipe + container
+#            restart, leaving the destination stopped with nothing to
+#            restore.
+#          * _read_manifest_remote now retries the remote file check once
+#            after a short delay instead of failing on the first miss.
+#          * when the manifest genuinely is missing on the remote,
+#            diagnostics now include a `find -maxdepth 2` of the whole
+#            Pasarguard directory, not just the (possibly nonexistent)
+#            db_dump/ subfolder — so it's clear whether extraction landed
+#            somewhere unexpected or didn't happen at all.
 #   v4.2.1 — security hardening pass:
 #          * `/tmp` backup staging dir replaced with tempfile.mkdtemp
 #            (0700) so the unencrypted .env + DB dump isn't world-readable
@@ -772,55 +787,88 @@ def launch_via_systemd(daemon_cmd, unit_name=None):
 # rest of the run instead of assuming a fixed name.
 _DB_SERVICE_CACHE = {}
 
-def _detect_db_service_local(d=None):
+def _detect_db_service_local(d=None, backend_type=None):
     d = d or PASARGUARD_DIR
     if d in _DB_SERVICE_CACHE:
         return _DB_SERVICE_CACHE[d]
     ok_v, out, _ = local_shell("docker compose config --services", cwd=d)
     services = [l.strip() for l in out.splitlines() if l.strip()] if ok_v else []
-    svc = _pick_db_service(services)
+    svc = _pick_db_service(services, backend_type=backend_type)
     _DB_SERVICE_CACHE[d] = svc
     return svc
 
-def _detect_db_service_ssh(ssh, d=None):
+def _detect_db_service_ssh(ssh, d=None, backend_type=None):
     d = d or PASARGUARD_DIR
     key = ("ssh", d)
     if key in _DB_SERVICE_CACHE:
         return _DB_SERVICE_CACHE[key]
     ec, out, _ = ssh_shell(ssh, f"cd {d} && docker compose config --services 2>/dev/null")
     services = [l.strip() for l in out.splitlines() if l.strip()] if ec == 0 else []
-    svc = _pick_db_service(services)
+    svc = _pick_db_service(services, backend_type=backend_type)
     _DB_SERVICE_CACHE[key] = svc
     return svc
 
-def _pick_db_service(services):
+# Default DB service name to fall back to when no service list could be
+# read. Indexed by backend_type so a mysql-only install gets "mysql" (which
+# actually exists), not "timescaledb" (which doesn't, and would cause the
+# script to try to docker exec into a non-existent service).
+_DEFAULT_DB_SERVICE = {
+    "postgresql":  "postgres",
+    "timescaledb": "timescaledb",
+    "mysql":       "mysql",
+    "mariadb":     "mariadb",
+    "sqlite":      None,        # SQLite has no service to wait for
+}
+
+def _pick_db_service(services, backend_type=None):
     """Pick the DB service name out of a list of compose services.
     Falls back to asking the user if it can't decide on its own.
 
     v4.2.1 — strips any non-service top-level keys that slipped through
     the parser (e.g. `services`, `name`, `version`). Without this, a buggy
     parser returning `['services']` would cause the script to try to
-    exec into a non-existent service literally called 'services'."""
+    exec into a non-existent service literally called 'services'.
+
+    v4.2.2 — accepts `backend_type` so the keyword list and the user
+    prompt both adapt. Previously the function hard-coded the
+    PostgreSQL-flavored prompt "Which service is the PostgreSQL
+    database?" even on a MySQL install, which (a) was misleading and
+    (b) caused a real failure when the picked container was then
+    `pg_isready`'d by wait_postgres_* — pg_isready doesn't exist in a
+    mysql image, so the wait timed out and the whole restore aborted."""
+    bt = (backend_type or "postgresql").lower()
+    default_svc = _DEFAULT_DB_SERVICE.get(bt, "timescaledb") or "timescaledb"
+
     if not services:
-        print_warning("Could not read docker-compose services — defaulting to 'timescaledb'.")
-        return "timescaledb"
+        print_warning(f"Could not read docker-compose services — defaulting to '{default_svc}'.")
+        return default_svc
 
     safe = [s for s in services if s not in _NON_SERVICE_KEYS and _SAFE_SERVICE_NAME_RE.match(s)]
     if not safe:
-        print_warning("No valid service names in compose output — defaulting to 'timescaledb'.")
-        return "timescaledb"
+        print_warning(f"No valid service names in compose output — defaulting to '{default_svc}'.")
+        return default_svc
 
     if len(safe) == 1:
         return safe[0]
 
-    keywords = ["timescaledb", "postgres", "postgresql", "pgsql", "db", "database"]
+    if bt in ("mysql", "mariadb"):
+        keywords = ["mysql", "mariadb", "db", "database"]
+        prompt_label = "MySQL/MariaDB"
+        prompt_default = "mysql"
+    else:
+        keywords = ["timescaledb", "postgres", "postgresql", "pgsql", "db", "database"]
+        prompt_label = "PostgreSQL"
+        prompt_default = "timescaledb"
+
     candidates = [s for s in safe if any(k in s.lower() for k in keywords)]
 
     if len(candidates) == 1:
         return candidates[0]
 
     print_warning(f"Multiple candidate DB services found: {', '.join(candidates or safe)}")
-    choice = input(f" {C.R2}> Which service is the PostgreSQL database? {C.RESET}").strip()
+    choice = input(
+        f" {C.R2}> Which service is the {prompt_label} database? [{prompt_default}]: {C.RESET}"
+    ).strip()
     return choice if choice in safe else (candidates[0] if candidates else safe[0])
 
 def db_service_local(d=None):
@@ -1216,13 +1264,42 @@ def stop_compose_ssh(ssh, d, label):
     print_error(f"{label}: could not stop all containers.")
     return False
 
-def wait_postgres_local():
-    svc = db_service_local()
-    print_info(f"Waiting for {svc} to become ready...")
+def wait_db_local(svc, backend_type=None):
+    """Wait for a DB container to become ready, dispatching by backend type.
+
+    v4.2.2 — renamed from wait_postgres_local and made backend-aware.
+    Previously this always exec'd `pg_isready` into the picked container,
+    which crashed on mysql/mariadb images (no such binary) and made the
+    whole restore abort with 'mysql did not start'. Now picks the right
+    readiness probe per backend:
+      - postgresql / timescaledb → pg_isready -U pasarguard -d postgres
+      - mysql / mariadb          → mysqladmin ping -uroot -h 127.0.0.1
+      - sqlite                   → no service to wait for, return True
+      - unknown                  → skip with a warning, return True
+    """
+    bt = (backend_type or "postgresql").lower()
+    print_info(f"Waiting for {svc} ({bt}) to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
+
+    if bt in ("postgresql", "timescaledb"):
+        cmd = (
+            f"docker compose exec -T {shlex.quote(svc)} "
+            f"pg_isready -U pasarguard -d postgres"
+        )
+    elif bt in ("mysql", "mariadb"):
+        cmd = (
+            f"docker compose exec -T {shlex.quote(svc)} "
+            f"mysqladmin ping -h 127.0.0.1 -uroot 2>/dev/null"
+        )
+    elif bt == "sqlite":
+        print_success("SQLite has no service to wait for — assuming ready.")
+        return True
+    else:
+        print_warning(f"Unknown backend type {bt!r} — skipping readiness check.")
+        return True
+
     while time.time() < deadline:
-        ok_v, _, _ = local_shell(
-            f"docker compose exec -T {shlex.quote(svc)} pg_isready -U pasarguard -d postgres", cwd=PASARGUARD_DIR)
+        ok_v, _, _ = local_shell(cmd, cwd=PASARGUARD_DIR)
         if ok_v:
             print_success("Database is ready.")
             return True
@@ -1230,13 +1307,32 @@ def wait_postgres_local():
     print_error("Database did not become ready in time.")
     return False
 
-def wait_postgres_ssh(ssh):
-    svc = db_service_ssh(ssh)
-    print_info(f"Waiting for {svc} to become ready...")
+
+def wait_db_ssh(ssh, svc, backend_type=None):
+    """SSH variant of wait_db_local — see wait_db_local for dispatch logic."""
+    bt = (backend_type or "postgresql").lower()
+    print_info(f"Waiting for {svc} ({bt}) to become ready...")
     deadline = time.time() + POSTGRES_READY_MAX_WAIT
+
+    if bt in ("postgresql", "timescaledb"):
+        cmd = (
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} "
+            f"pg_isready -U pasarguard -d postgres"
+        )
+    elif bt in ("mysql", "mariadb"):
+        cmd = (
+            f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} "
+            f"mysqladmin ping -h 127.0.0.1 -uroot 2>/dev/null"
+        )
+    elif bt == "sqlite":
+        print_success("SQLite has no service to wait for — assuming ready.")
+        return True
+    else:
+        print_warning(f"Unknown backend type {bt!r} — skipping readiness check.")
+        return True
+
     while time.time() < deadline:
-        ec, _, _ = ssh_shell(
-            ssh, f"cd {PASARGUARD_DIR} && docker compose exec -T {shlex.quote(svc)} pg_isready -U pasarguard -d postgres")
+        ec, _, _ = ssh_shell(ssh, cmd)
         if ec == 0:
             print_success("Database is ready.")
             return True
@@ -1244,7 +1340,15 @@ def wait_postgres_ssh(ssh):
     print_error("Database did not become ready in time.")
     return False
 
-def start_compose_local(d, label, services=None, wait_postgres=False):
+# Back-compat shims — older callers (if any external scripts import this
+# module) keep working. Internally we now always call wait_db_* directly.
+def wait_postgres_local():
+    return wait_db_local(db_service_local(), backend_type="postgresql")
+
+def wait_postgres_ssh(ssh):
+    return wait_db_ssh(ssh, db_service_ssh(ssh), backend_type="postgresql")
+
+def start_compose_local(d, label, services=None, wait_db=False, backend_type=None):
     if not os.path.isdir(d) or not os.path.isfile(os.path.join(d, "docker-compose.yml")):
         print_error(f"{label}: compose project not found at {d}")
         return False
@@ -1264,10 +1368,14 @@ def start_compose_local(d, label, services=None, wait_postgres=False):
     if not run_command(f"docker compose up -d {svc_q}".strip(), cwd=d):
         print_error(f"{label}: docker compose up failed.")
         return False
-    if wait_postgres and not wait_postgres_local():
-        return False
+    # v4.2.2 — wait_db is now backend-aware. The DB service to probe
+    # is the first one in `services` (matches what workflow_transfer /
+    # workflow_manual_restore pass in: services=[remote_db_svc]).
+    if wait_db and safe_services:
+        if not wait_db_local(safe_services[0], backend_type=backend_type):
+            return False
     expected = _expected_count_local(d, services)
-    if expected == 0 and not wait_postgres:
+    if expected == 0 and not wait_db:
         print_warning(f"{label}: assuming startup succeeded.")
         return True
     deadline = time.time() + COMPOSE_UP_MAX_WAIT
@@ -1279,7 +1387,7 @@ def start_compose_local(d, label, services=None, wait_postgres=False):
     print_error(f"{label}: startup verification failed.")
     return False
 
-def start_compose_ssh(ssh, d, label, services=None, wait_postgres=False):
+def start_compose_ssh(ssh, d, label, services=None, wait_db=False, backend_type=None):
     ec, _, _ = ssh_shell(ssh, f"test -d {d} && test -f {d}/docker-compose.yml")
     if ec != 0:
         print_error(f"{label}: compose project not found at {d}")
@@ -1299,10 +1407,12 @@ def start_compose_ssh(ssh, d, label, services=None, wait_postgres=False):
         print_error(f"{label}: docker compose up failed.")
         if er: print_error(er)
         return False
-    if wait_postgres and not wait_postgres_ssh(ssh):
-        return False
+    # v4.2.2 — wait_db is now backend-aware (see wait_db_ssh for dispatch).
+    if wait_db and safe_services:
+        if not wait_db_ssh(ssh, safe_services[0], backend_type=backend_type):
+            return False
     expected = _expected_count_ssh(ssh, d, services)
-    if expected == 0 and not wait_postgres:
+    if expected == 0 and not wait_db:
         print_warning(f"{label}: assuming startup succeeded.")
         return True
     deadline = time.time() + COMPOSE_UP_MAX_WAIT
@@ -1349,6 +1459,268 @@ def clean_dirs_ssh(ssh, include_node=True):
             print_error(f"Failed to clean {desc}")
             return False
     print_success("Target directories cleaned.")
+    return True
+
+# ── MySQL data-dir wipe (v4.2.3) ───────────────────────────────
+# MySQL/MariaDB only honours MYSQL_ROOT_PASSWORD / MYSQL_PASSWORD from
+# the container environment on FIRST initialisation. If the data
+# directory already contains a database (i.e. it survived from a
+# previous run on the destination host), MySQL keeps the OLD password
+# and silently ignores the new one in .env — leading to "Access denied
+# (1045)" errors during restore, even though the .env we just extracted
+# has the right password.
+#
+# Docker's own `docker compose down -v` only removes Docker NAMED
+# volumes. It does NOT remove bind mounts (host paths bind-mounted
+# into the container). A typical PasarGuard install on Hetzner /
+# Contabo / etc. bind-mounts /var/lib/mysql from /var/lib/mysql/<name>
+# on the host, which survives `down -v` and leaves the OLD password
+# intact. That's the root cause of the 1045 chain the user hit.
+#
+# The two functions below detect where MySQL stores its data (named
+# volume OR bind mount) by parsing docker-compose.yml, and remove it
+# explicitly BEFORE we start MySQL, so it re-inits cleanly with the
+# credentials from the new .env.
+
+def _parse_mysql_data_mount(compose_text, svc):
+    """Find the data-dir mount for the MySQL/MariaDB service in a
+    docker-compose.yml text. Returns (source, type) where type is
+    'bind' or 'volume', or (None, None) if not found.
+
+    Recognises these patterns inside the mysql service:
+        - /host/path:/var/lib/mysql        (short-form bind mount)
+        - vol_name:/var/lib/mysql          (short-form named volume)
+        - type: volume / source: vol_name  (long-form)
+    Both /var/lib/mysql and /var/lib/mariadb are accepted as the target."""
+    if not compose_text:
+        return None, None
+
+    lines = compose_text.splitlines()
+    in_services   = False
+    in_target_svc = False
+    in_volumes    = False
+    vol_indent    = None
+    long_vol      = {}  # type/source/target/etc. for long-form mount
+
+    for raw in lines:
+        stripped = raw.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(stripped)
+
+        # Top-level keys (indent 0).
+        if indent == 0:
+            if stripped == "services:":
+                in_services = True
+            elif in_services:
+                in_services = False
+            continue
+        if not in_services:
+            continue
+
+        # Service name line (indent 2, ends with ':', not a list item).
+        if (indent == 2 and stripped.endswith(":")
+                and not stripped.startswith("-")
+                and not stripped.startswith("&")
+                and not stripped.startswith("*")):
+            current_svc = stripped[:-1].strip().strip("'\"").strip()
+            in_target_svc = (current_svc == svc)
+            in_volumes = False
+            long_vol = {}
+            continue
+        if not in_target_svc:
+            continue
+
+        # `volumes:` subsection opener.
+        if indent >= 4 and stripped == "volumes:":
+            in_volumes = True
+            vol_indent = indent
+            long_vol = {}
+            continue
+
+        # Leaving the volumes subsection when indentation decreases.
+        if in_volumes and indent <= vol_indent:
+            in_volumes = False
+            long_vol = {}
+
+        if not in_volumes:
+            continue
+
+        # Short-form list item: `- source:target[:mode]`
+        if stripped.startswith("-"):
+            mount = stripped.lstrip("- ").strip().strip('"').strip("'")
+            if ":" in mount:
+                src, tgt = mount.split(":", 1)
+                tgt = tgt.strip()
+                if tgt.rstrip("/") in ("/var/lib/mysql", "/var/lib/mariadb"):
+                    src = src.strip()
+                    if not src:
+                        continue
+                    if src.startswith("/") or src.startswith("."):
+                        return src, "bind"
+                    return src, "volume"
+            continue
+
+        # Long-form key (type, source, target, read_only, ...).
+        if ":" in stripped:
+            k, v = stripped.split(":", 1)
+            long_vol[k.strip()] = v.strip().strip('"').strip("'")
+            tgt = long_vol.get("target", "").rstrip("/")
+            if tgt in ("/var/lib/mysql", "/var/lib/mariadb"):
+                src = long_vol.get("source", "").strip()
+                if not src:
+                    continue
+                mtype = long_vol.get("type", "volume").strip().lower()
+                if mtype == "bind":
+                    return src, "bind"
+                return src, "volume"
+
+    return None, None
+
+
+def _wipe_mysql_data_remote(ssh, svc):
+    """v4.2.3 — detect and remove MySQL data on the remote host so the
+    container re-inits with the credentials from the new .env.
+
+    Returns True on success (or when there's nothing to wipe), False if
+    the wipe itself failed and we couldn't recover. We do NOT abort the
+    whole transfer on failure — the existing restore code will try
+    anyway and surface a precise 1045 error if the data really is
+    stale, which is more informative than silently bailing here."""
+    ec, compose_text, _ = ssh_shell(ssh,
+        f"cat {shlex.quote(PASARGUARD_DIR)}/docker-compose.yml 2>/dev/null")
+    if ec != 0 or not compose_text:
+        ec, compose_text, _ = ssh_shell(ssh,
+            f"cd {shlex.quote(PASARGUARD_DIR)} && docker compose config 2>/dev/null")
+
+    source, mtype = _parse_mysql_data_mount(compose_text or "", svc)
+
+    # Fallback: if compose parsing yielded nothing, look at any volume
+    # whose name contains mysql/mariadb/pasarguard. Covers the case
+    # where the compose file uses YAML anchors or `extends:` that the
+    # parser can't fully resolve.
+    if not source:
+        ec, vols, _ = ssh_shell(ssh,
+            "docker volume ls --format '{{.Name}}' 2>/dev/null | "
+            "grep -iE 'mysql|mariadb|pasarguard' | head -1")
+        if ec == 0 and vols.strip():
+            source = vols.strip().splitlines()[0].strip()
+            mtype = "volume"
+
+    if not source:
+        print_warning(
+            f"Could not detect MySQL data mount for service {svc!r} on the remote."
+        )
+        print_warning(
+            "If MySQL has stale data on a bind mount that survived `docker compose down -v`,"
+        )
+        print_warning(
+            "restore may fail with 1045 'Access denied'. Wipe the host data dir manually if so."
+        )
+        return True
+
+    if mtype == "bind":
+        print_info(f"MySQL data is bind-mounted from {source!r}. Removing...")
+        # Recreate the parent so MySQL can re-mount into an empty dir on
+        # first start (otherwise mount may fail with 'directory not empty'
+        # or similar on some filesystems).
+        ec, _, err = ssh_shell(ssh,
+            f"rm -rf {shlex.quote(source)} && mkdir -p {shlex.quote(source)}")
+        if ec != 0:
+            print_error(f"Could not wipe bind mount {source}: {(err or '').strip()}")
+            return False
+        print_success(f"Wiped MySQL data at {source} (bind mount).")
+
+    elif mtype == "volume":
+        print_info(f"MySQL data is on Docker volume {source!r}. Removing...")
+        ec, _, err = ssh_shell(ssh, f"docker volume rm {shlex.quote(source)} 2>&1")
+        if ec != 0:
+            err_clean = (err or "").strip()
+            if "in use" in err_clean.lower() or "being used" in err_clean.lower():
+                print_warning(f"Volume {source!r} is still referenced; forcing removal...")
+                ec2, _, err2 = ssh_shell(ssh,
+                    f"docker volume rm -f {shlex.quote(source)} 2>&1")
+                if ec2 != 0:
+                    print_error(f"Could not remove volume {source}: {(err2 or '').strip()}")
+                    return False
+            else:
+                print_error(f"Could not remove volume {source}: {err_clean}")
+                return False
+        print_success(f"Removed MySQL volume {source}.")
+    else:
+        print_warning(f"Unknown MySQL mount type {mtype!r}; skipping wipe.")
+        return True
+
+    return True
+
+
+def _wipe_mysql_data_local(svc):
+    """v4.2.3 — local counterpart of _wipe_mysql_data_remote (used by
+    workflow_manual_restore when the script is being run on the same
+    machine that hosts the destination stack)."""
+    compose_path = os.path.join(PASARGUARD_DIR, "docker-compose.yml")
+    compose_text = ""
+    try:
+        with open(compose_path) as f:
+            compose_text = f.read()
+    except FileNotFoundError:
+        pass
+    if not compose_text:
+        ok_v, out, _ = local_shell("docker compose config 2>/dev/null", cwd=PASARGUARD_DIR)
+        if ok_v:
+            compose_text = out
+
+    source, mtype = _parse_mysql_data_mount(compose_text or "", svc)
+
+    if not source:
+        ok_v, out, _ = local_shell(
+            "docker volume ls --format '{{.Name}}' 2>/dev/null | "
+            "grep -iE 'mysql|mariadb|pasarguard' | head -1",
+            cwd=PASARGUARD_DIR)
+        if ok_v and out.strip():
+            source = out.strip().splitlines()[0].strip()
+            mtype = "volume"
+
+    if not source:
+        print_warning(
+            f"Could not detect MySQL data mount for service {svc!r} locally."
+        )
+        print_warning(
+            "If MySQL has stale data on a bind mount that survived `docker compose down -v`,"
+        )
+        print_warning(
+            "restore may fail with 1045 'Access denied'. Wipe the host data dir manually if so."
+        )
+        return True
+
+    if mtype == "bind":
+        print_info(f"MySQL data is bind-mounted from {source!r}. Removing...")
+        rm = subprocess.run(["rm", "-rf", source], capture_output=True, text=True)
+        if rm.returncode != 0:
+            print_error(f"Could not wipe bind mount {source}: {rm.stderr.strip()}")
+            return False
+        os.makedirs(source, exist_ok=True)
+        print_success(f"Wiped MySQL data at {source} (bind mount).")
+    elif mtype == "volume":
+        print_info(f"MySQL data is on Docker volume {source!r}. Removing...")
+        rm = subprocess.run(["docker", "volume", "rm", source],
+                             capture_output=True, text=True)
+        if rm.returncode != 0:
+            err_clean = (rm.stderr or "").strip()
+            if "in use" in err_clean.lower() or "being used" in err_clean.lower():
+                rm2 = subprocess.run(["docker", "volume", "rm", "-f", source],
+                                      capture_output=True, text=True)
+                if rm2.returncode != 0:
+                    print_error(f"Could not remove volume {source}: {rm2.stderr.strip()}")
+                    return False
+            else:
+                print_error(f"Could not remove volume {source}: {err_clean}")
+                return False
+        print_success(f"Removed MySQL volume {source}.")
+    else:
+        print_warning(f"Unknown MySQL mount type {mtype!r}; skipping wipe.")
+        return True
+
     return True
 
 # ── Telegram ─────────────────────────────────────────────────
@@ -1717,8 +2089,17 @@ def _backup_postgres_local(backend, db_dir):
     svc = backend.get("container") or "postgres"
     user = backend["user"] or "pasarguard"
 
+    # v4.2.2 — run ALL dumps first and collect their results, then write
+    # the manifest ONLY if every dump (including globals) succeeded.
+    # The previous order opened manifest.tsv for writing before any
+    # pg_dump ran, and the dump's return code was ignored — so a fully
+    # failed backup would still leave a "complete" manifest on disk.
+    # On restore the dispatcher would happily walk that manifest and try
+    # to load the (empty) .sql files, producing the misleading
+    # 'manifest.tsv not found or empty' error elsewhere because the
+    # database restore itself silently produced nothing.
     print_info("Exporting PostgreSQL globals (pg_dumpall)...")
-    run_command(
+    globals_ok = run_command(
         f"docker compose exec -T {shlex.quote(svc)} pg_dumpall -U {shlex.quote(user)} --globals-only",
         output_file=os.path.join(db_dir, "globals.sql"),
         cwd=PASARGUARD_DIR,
@@ -1727,19 +2108,46 @@ def _backup_postgres_local(backend, db_dir):
     databases = _list_databases_local(svc)
     print_info(f"Found {len(databases)} Pasarguard database(s): {', '.join(databases)}")
 
+    results = []  # list of (db, sql_file, has_ts, ts_ver, ok)
+    for idx, db in enumerate(databases, 1):
+        sql_file = f"db-{idx:03d}.sql"
+        has_ts, ts_ver = _pg_db_timescale_info(svc, user, db)
+        print_info(f"Exporting database {C.BOLD}{db}{C.RESET} → {sql_file}  (may take a while)")
+        ok = run_command(
+            f"docker compose exec -T {shlex.quote(svc)} pg_dump -U {shlex.quote(user)} "
+            f"--clean --if-exists -d {shlex.quote(db)}",
+            output_file=os.path.join(db_dir, sql_file),
+            cwd=PASARGUARD_DIR,
+        )
+        results.append((db, sql_file, has_ts, ts_ver, ok))
+
+    all_ok = globals_ok and all(r[4] for r in results)
+    if not all_ok:
+        failed = [r[0] for r in results if not r[4]]
+        print_error(
+            f"One or more database dumps failed "
+            f"({', '.join(failed) if failed else 'globals'}); NOT writing manifest."
+        )
+        print_error("Re-run the backup once the underlying pg_dump / connection issue is fixed.")
+        # Clean up the partial .sql files so they don't get picked up as a
+        # 'complete' backup on a future manual restore.
+        for db, sql_file, _, _, ok in results:
+            if not ok:
+                try:
+                    os.remove(os.path.join(db_dir, sql_file))
+                except OSError:
+                    pass
+        if not globals_ok:
+            try:
+                os.remove(os.path.join(db_dir, "globals.sql"))
+            except OSError:
+                pass
+        return False
+
     manifest_path = os.path.join(db_dir, "manifest.tsv")
     with open(manifest_path, "w") as mf:
         mf.write(f"# pg_backup_manifest\tv4.2\tformat=tsv\tdb_type={backend['type']}\n")
-        for idx, db in enumerate(databases, 1):
-            sql_file = f"db-{idx:03d}.sql"
-            has_ts, ts_ver = _pg_db_timescale_info(svc, user, db)
-            print_info(f"Exporting database {C.BOLD}{db}{C.RESET} → {sql_file}  (may take a while)")
-            run_command(
-                f"docker compose exec -T {shlex.quote(svc)} pg_dump -U {shlex.quote(user)} "
-                f"--clean --if-exists -d {shlex.quote(db)}",
-                output_file=os.path.join(db_dir, sql_file),
-                cwd=PASARGUARD_DIR,
-            )
+        for db, sql_file, has_ts, ts_ver, _ in results:
             mf.write(f"{db}\t{user}\t{1 if has_ts else 0}\t{sql_file}\t{ts_ver}\n")
 
     print_success(f"Wrote manifest with {len(databases)} database entr{'y' if len(databases)==1 else 'ies'}.")
@@ -1768,36 +2176,106 @@ def _backup_mysql_local(backend, db_dir):
     the host environment to the container unless told to with `-e`, so the
     previous `MYSQL_PWD=... docker compose exec ...` form silently had no
     effect and mysqldump would hang on / fail an interactive password
-    prompt. Passing it via `exec -e` fixes that."""
+    prompt. Passing it via `exec -e` fixes that.
+
+    v4.2.2 — try multiple credential candidates instead of one. Previously
+    this function used only the user/password parsed out of
+    SQLALCHEMY_DATABASE_URL (with a fallback to DB_USER/DB_PASSWORD in
+    .env), and bailed on the first 1045 'Access denied'. That was
+    asymmetric with _restore_mysql_local, which already iterates over
+    (DB_USER,DB_PASSWORD) and (root,MYSQL_ROOT_PASSWORD). On installs
+    where the panel's URL happens to carry one credential pair but the
+    actual MySQL accepts a different one (very common — the panel
+    normally uses `pasarguard/<DB_PASSWORD>` while root has
+    `MYSQL_ROOT_PASSWORD`), the backup would fail and the user had no
+    obvious fix short of editing the script. We now try all known pairs
+    and stop at the first one that succeeds."""
     svc    = backend.get("container")
-    user   = backend["user"] or "root"
-    pwd    = backend["password"]
     dbname = backend["dbname"] or "pasarguard"
 
     if not svc:
         print_error("Could not identify the MySQL/MariaDB container — aborting.")
         return False
 
-    env_flag = f"-e MYSQL_PWD={shlex.quote(pwd)} " if pwd else ""
+    # Build the candidate credential list. Order matters: prefer the creds
+    # the panel itself uses (so the dump captures the same data the panel
+    # sees), then fall back to whatever else is in .env.
+    env      = _read_env_file(os.path.join(PASARGUARD_DIR, ".env"))
+    url_user = backend["user"] or ""
+    url_pwd  = backend["password"] or ""
+    db_user  = env.get("DB_USER", "") or ""
+    db_pwd   = env.get("DB_PASSWORD", "") or ""
+    root_pwd = env.get("MYSQL_ROOT_PASSWORD", "") or ""
+
+    candidates = []
+    for cu, cp in ((url_user, url_pwd),
+                   (db_user,  db_pwd),
+                   ("root",   root_pwd)):
+        if cu and cp and (cu, cp) not in candidates:
+            candidates.append((cu, cp))
+    if not candidates:
+        # Last resort: try root with no password (some local dev setups).
+        candidates.append(("root", ""))
+
     sql_file = "db-001.sql"
     out_path = os.path.join(db_dir, sql_file)
-    print_info(f"Exporting {backend['type']} database {C.BOLD}{dbname}{C.RESET} → {sql_file}  (may take a while)")
-    ok = run_command(
-        f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysqldump "
-        f"-u {shlex.quote(user)} --single-transaction --quick --triggers --events --routines "
-        f"--hex-blob --default-character-set=utf8mb4 {shlex.quote(dbname)}",
-        output_file=out_path,
-        cwd=PASARGUARD_DIR,
-    )
-    if not ok:
-        return False
 
-    manifest_path = os.path.join(db_dir, "manifest.tsv")
-    with open(manifest_path, "w") as mf:
-        mf.write(f"# pg_backup_manifest\tv4.2\tformat=tsv\tdb_type={backend['type']}\n")
-        mf.write(f"{dbname}\t{user}\t0\t{sql_file}\t\n")
-    print_success(f"Wrote manifest for {backend['type']} database '{dbname}'.")
-    return True
+    last_err = ""
+    for cred_user, cred_pwd in candidates:
+        env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
+        print_info(
+            f"Exporting {backend['type']} database {C.BOLD}{dbname}{C.RESET} → {sql_file}  "
+            f"(as user '{cred_user}')  (may take a while)"
+        )
+        # Run silently — we'll surface the LAST error only if every
+        # candidate fails, so the user sees one clean diagnosis instead of
+        # a wall of red.
+        try:
+            with open(out_path, "w") as _f:
+                # v4.2.2 — added --databases (== -B). Without it mysqldump
+                # writes only CREATE TABLE statements; on restore the
+                # target database doesn't exist yet (fresh MySQL on a new
+                # server) and every statement blows up with "No database
+                # selected". --databases prepends CREATE DATABASE and USE,
+                # so the dump is self-sufficient on restore.
+                subprocess.run(
+                    f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysqldump "
+                    f"--databases --single-transaction --quick --triggers "
+                    f"--events --routines --hex-blob --default-character-set=utf8mb4 "
+                    f"{shlex.quote(dbname)}",
+                    shell=True, check=True, stdout=_f,
+                    stderr=subprocess.PIPE, cwd=PASARGUARD_DIR,
+                )
+            # Dump succeeded.
+            manifest_path = os.path.join(db_dir, "manifest.tsv")
+            with open(manifest_path, "w") as mf:
+                mf.write(f"# pg_backup_manifest\tv4.2\tformat=tsv\tdb_type={backend['type']}\n")
+                mf.write(f"{dbname}\t{cred_user}\t0\t{sql_file}\t\n")
+            print_success(
+                f"Wrote manifest for {backend['type']} database '{dbname}' "
+                f"(dump produced via user '{cred_user}')."
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            err = e.stderr.decode("utf-8", errors="replace").strip() if e.stderr else ""
+            # Trim the noisy mysqldump banner to the first useful line.
+            first_line = next((ln for ln in err.splitlines() if ln.strip()), err)
+            print_warning(f"  mysqldump as '{cred_user}' failed: {first_line}")
+            last_err = err
+
+    print_error(
+        f"All {len(candidates)} credential combination(s) failed for MySQL/MariaDB dump."
+    )
+    if last_err:
+        print_error(f"Last mysqldump error:\n{last_err}")
+    print_error(
+        "Check DB_USER/DB_PASSWORD and MYSQL_ROOT_PASSWORD in /opt/pasarguard/.env,"
+    )
+    print_error(
+        "and confirm one of those users can read the '{0}' database inside the '{svc}' container."
+        .format(dbname, svc=svc)
+    )
+    return False
 
 def _backup_sqlite_local(backend, db_dir):
     candidates = []
@@ -1857,6 +2335,165 @@ def _read_manifest(db_dir):
             db_type = "mysql"
     return db_type, entries
 
+def _read_manifest_remote(ssh, db_dir):
+    """v4.2.2 — read manifest.tsv from the REMOTE host via SSH.
+
+    The previous code path used the purely-local `_read_manifest()`
+    inside `_restore_databases_remote`, so the transfer-to-new-server
+    flow would always see an empty manifest — even when the file was
+    sitting on the remote at /opt/pasarguard/db_dump/manifest.tsv.
+    Symptom: 'manifest.tsv not found or empty — cannot restore
+    databases' immediately after a successful `unzip` and a green
+    Pasarguard DB startup, which (correctly) told the user nothing
+    about why the restore was failing.
+
+    We now `cat` the file over SSH and run it through the same parser
+    logic. db_dir is the relative path on the remote (typically
+    'db_dump') — joined onto PASARGUARD_DIR for the SSH commands.
+    Returns (db_type, entries) just like _read_manifest, or (None, [])
+    if the file doesn't exist or can't be read."""
+    remote_manifest = f"{PASARGUARD_DIR}/{db_dir}/manifest.tsv"
+    ec, _, _ = ssh_shell(ssh, f"test -f {shlex.quote(remote_manifest)}")
+    if ec != 0:
+        # v4.2.4 — one short retry before giving up. Harmless in the
+        # normal case (extraction already finished synchronously via
+        # execute_ssh_command's recv_exit_status), but cheap insurance
+        # against any environment where the SFTP/SSH session sees a
+        # stale directory listing for a moment after `unzip` returns.
+        time.sleep(1.5)
+        ec, _, _ = ssh_shell(ssh, f"test -f {shlex.quote(remote_manifest)}")
+    if ec != 0:
+        return None, []
+    ec, text, _ = ssh_shell(ssh, f"cat {shlex.quote(remote_manifest)}")
+    if ec != 0 or not text:
+        return None, []
+
+    db_type = None
+    entries = []
+    for raw in text.splitlines():
+        line = raw.rstrip("\n")
+        if not line.strip() or line.lstrip().startswith("#"):
+            if "db_type=" in line:
+                for part in line.split():
+                    if part.startswith("db_type="):
+                        db_type = part.split("=", 1)[1]
+            continue
+        cols = line.split("\t")
+        if len(cols) < 4:
+            continue
+        db       = cols[0]
+        sql_file = cols[3]
+        has_ts   = cols[2] == "1" if len(cols) > 2 else False
+        ts_ver   = cols[4] if len(cols) > 4 else ""
+        if db and sql_file:
+            entries.append((db, sql_file, has_ts, ts_ver))
+    if not db_type:
+        if any(f.endswith(".sqlite3") or f.endswith(".sqlite") or f == "db_backup.sqlite" for _, f, _, _ in entries):
+            db_type = "sqlite"
+        elif entries:
+            db_type = "postgresql"
+    return db_type, entries
+
+def _verify_zip_has_manifest(zip_path):
+    """v4.2.4 — sanity-check a freshly-created backup archive BEFORE it's
+    uploaded anywhere. Opens the zip locally, looks for db_dump/manifest.tsv,
+    and confirms it has at least one non-comment, non-empty data row.
+    Returns True/False; prints its own error on failure so callers can just
+    check the return value."""
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            names = z.namelist()
+            manifest_name = next(
+                (n for n in names if n.replace("\\", "/").rstrip("/") == "db_dump/manifest.tsv"),
+                None,
+            )
+            if not manifest_name:
+                print_error("Archive sanity check: db_dump/manifest.tsv is missing from the zip.")
+                print_error(f"  → Archive contains: {', '.join(sorted(names)) or '(empty)'}")
+                return False
+            raw = z.read(manifest_name).decode("utf-8", errors="replace")
+            data_rows = [
+                ln for ln in raw.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+            ]
+            if not data_rows:
+                print_error("Archive sanity check: manifest.tsv has no database entries.")
+                return False
+            return True
+    except (zipfile.BadZipFile, OSError) as e:
+        print_error(f"Archive sanity check failed: could not open {zip_path}: {e}")
+        return False
+
+def _diagnose_missing_manifest(db_dir, *, ssh=None):
+    """v4.2.2 — when _read_manifest finds nothing, print useful diagnostics
+    instead of the bare 'manifest.tsv not found or empty'. Tells the user
+    whether db_dir even exists, what files it contains (if any), and
+    points at likely root causes (incomplete extraction, backup from an
+    older script version, mid-backup dump failure, etc.)."""
+    print_error("manifest.tsv not found or empty — cannot restore databases.")
+
+    if ssh is not None:
+        # v4.2.2 — db_dir is relative ("db_dump") and lives under
+        # PASARGUARD_DIR on the remote. cd first so the relative path
+        # resolves correctly; the previous bare `ls -la db_dump` would
+        # look in the SSH session's home (~root) and always report
+        # "does not exist" even when /opt/pasarguard/db_dump was fine.
+        ec, out, _ = ssh_shell(ssh,
+            f"cd {shlex.quote(PASARGUARD_DIR)} && ls -la {shlex.quote(db_dir)} 2>/dev/null")
+        if ec != 0 or not out.strip():
+            print_error(f"  → {PASARGUARD_DIR}/{db_dir} does not exist on the remote host.")
+            print_error("     The backup archive probably didn't extract. Check free disk space,")
+            print_error("     permissions on /opt/pasarguard/, and the 'Extracting files' log.")
+            # v4.2.4 — show what actually IS in PASARGUARD_DIR, since
+            # "the directory doesn't exist" alone doesn't tell you whether
+            # the zip extracted somewhere else, extracted empty, or never
+            # landed on disk at all.
+            ec2, tree, _ = ssh_shell(ssh,
+                f"find {shlex.quote(PASARGUARD_DIR)} -maxdepth 2 2>/dev/null")
+            if ec2 == 0 and tree.strip():
+                print_error(f"  → Actual contents of {PASARGUARD_DIR} (depth 2):")
+                for line in tree.splitlines():
+                    print_error(f"      {line}")
+            return
+        print_error(f"  → Remote {PASARGUARD_DIR}/{db_dir}/ contents:")
+        for line in out.splitlines():
+            print_error(f"      {line}")
+        files = [ln.split()[-1] for ln in out.splitlines() if ln.startswith("-")]
+    else:
+        if not os.path.isdir(db_dir):
+            print_error(f"  → {db_dir} does not exist locally.")
+            print_error("     The backup archive probably didn't extract. Check the 'Extracting' log.")
+            return
+        try:
+            files = sorted(os.listdir(db_dir))
+        except OSError as e:
+            print_error(f"  → Cannot list {db_dir}: {e}")
+            return
+        if not files:
+            print_error(f"  → {db_dir} is empty (no files extracted).")
+            return
+        print_error(f"  → Local {db_dir}/ contents: {', '.join(files)}")
+
+    has_sql    = any(f.endswith(".sql") for f in files)
+    has_sqlite = any(f.endswith(".sqlite") or f.endswith(".sqlite3") for f in files)
+    manifest_present = "manifest.tsv" in files
+
+    if manifest_present:
+        print_error("  → manifest.tsv exists but has no usable data rows.")
+        print_error("     Check that the backup was created by a compatible version of this")
+        print_error("     script (v4.0+ writes tab-separated rows; older versions used spaces).")
+    elif has_sql:
+        print_error("  → .sql files exist but manifest.tsv is missing.")
+        print_error("     The backup may have been created with an older version of this script,")
+        print_error("     OR pg_dump / mysqldump failed mid-run (in v4.2.2 the manifest is only")
+        print_error("     written when ALL dumps succeed — run the backup again to recreate it).")
+    elif has_sqlite:
+        print_error("  → SQLite db file exists but manifest.tsv is missing.")
+        print_error("     The backup may be from an older script version or be incomplete.")
+    else:
+        print_error("  → No SQL or SQLite files found. The backup appears incomplete.")
+        print_error("     Re-download / re-upload the archive and try again.")
+
 # ── Per-backend restore dispatchers ──────────────────────────
 def _is_safe_restore_target(path, allowed_prefix):
     """Return True if `path` (after symlink resolution) is inside
@@ -1903,9 +2540,11 @@ def _safe_extract_zip(zip_path, dest):
 
 
 def _restore_databases_remote(ssh, db_dir, remote_db_svc, backend_type=None):
-    db_type, entries = _read_manifest(db_dir)
+    # v4.2.2 — manifest.tsv lives on the REMOTE host after extraction,
+    # so we read it via SSH (see _read_manifest_remote), not locally.
+    db_type, entries = _read_manifest_remote(ssh, db_dir)
     if not entries:
-        print_error("manifest.tsv not found or empty — cannot restore databases.")
+        _diagnose_missing_manifest(db_dir, ssh=ssh)
         return False
     effective_type = backend_type or db_type or "postgresql"
     print_info(f"Manifest declares backend: {effective_type}  ({len(entries)} database entr{'y' if len(entries)==1 else 'ies'})")
@@ -1922,7 +2561,7 @@ def _restore_databases_remote(ssh, db_dir, remote_db_svc, backend_type=None):
 def _restore_databases_local(db_dir, local_db_svc, backend_type=None):
     db_type, entries = _read_manifest(db_dir)
     if not entries:
-        print_error("manifest.tsv not found or empty — cannot restore databases.")
+        _diagnose_missing_manifest(db_dir)
         return False
     effective_type = backend_type or db_type or "postgresql"
     print_info(f"Manifest declares backend: {effective_type}  ({len(entries)} database entr{'y' if len(entries)==1 else 'ies'})")
@@ -2029,6 +2668,7 @@ def _restore_mysql_remote(ssh, db_dir, svc, entries):
             print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
             return False
         print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
+
         ec, env_text, _ = ssh_shell(ssh, f"grep -E '^(DB_PASSWORD|MYSQL_ROOT_PASSWORD|DB_USER|DB_NAME)=' {PASARGUARD_DIR}/.env")
         env_lines = {}
         for ln in env_text.splitlines():
@@ -2042,25 +2682,70 @@ def _restore_mysql_remote(ssh, db_dir, svc, entries):
         candidates = []
         if user and user_pwd:
             candidates.append((user, user_pwd))
-        if root_pwd:
+        if root_pwd and ("root", root_pwd) not in candidates:
             candidates.append(("root", root_pwd))
 
+        # v4.2.2 — figure out whether the dump is self-sufficient
+        # (contains its own CREATE DATABASE / USE statements, i.e. it was
+        # produced by mysqldump --databases) or not (an older dump
+        # without --databases that only contains CREATE TABLE).
+        #   * Self-sufficient dumps are loaded as-is via `mysql -u USER`.
+        #   * Older dumps need CREATE DATABASE + USE prepended in a
+        #     subshell pipe; otherwise every CREATE TABLE in the dump
+        #     would fail with 'No database selected' on a freshly-
+        #     initialised MySQL container.
+        # Either way we deliberately avoid `mysql -e "..."` because on
+        # MariaDB images without /etc/mysql/my.cnf the client then errors
+        # out with 'no configuration file provided: not found' (a MariaDB
+        # quirk) instead of running the statement.
+        dump_path = f"{PASARGUARD_DIR}/{db_dir}/{sql_file}"
+        ec_probe, head_text, _ = ssh_shell(ssh, f"head -n 20 {shlex.quote(dump_path)}")
+        dump_has_create_db = ec_probe == 0 and "CREATE DATABASE" in (head_text or "")
+
         restored = False
+        last_err = ""
         for cred_user, cred_pwd in candidates:
-            # v4.2 fix: MYSQL_PWD passed via `docker compose exec -e`, not
-            # the SSH shell's own environment (which the container never sees).
             env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
-            cmd = (
-                f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-                f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysql -u {shlex.quote(cred_user)}"
-            )
-            ec2, _, _ = ssh_shell(ssh, cmd)
+            if dump_has_create_db:
+                cmd = (
+                    f"cd {PASARGUARD_DIR} && "
+                    f"cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
+                    f"docker compose exec -T {env_flag}{shlex.quote(svc)} "
+                    f"mysql -u {shlex.quote(cred_user)}"
+                )
+            else:
+                # Prepend CREATE DATABASE + USE in a subshell so the dump's
+                # CREATE TABLE statements have a database to land in.
+                # echo + single-quoted SQL keeps backticks literal so mysql
+                # (not the shell) interprets them as identifier delimiters.
+                create_echo = (
+                    f"echo 'CREATE DATABASE IF NOT EXISTS `{db}` "
+                    f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;'"
+                )
+                use_echo = f"echo 'USE `{db}`;'"
+                cmd = (
+                    f"cd {PASARGUARD_DIR} && "
+                    f"( {create_echo} ; {use_echo} ; "
+                    f"cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} ) | "
+                    f"docker compose exec -T {env_flag}{shlex.quote(svc)} "
+                    f"mysql -u {shlex.quote(cred_user)}"
+                )
+            ec2, _, err2 = ssh_shell(ssh, cmd)
             if ec2 == 0:
                 print_success(f"Restored using credentials for user '{cred_user}'.")
                 restored = True
                 break
+            last_err = err2 or ""
+            first_line = next((ln for ln in last_err.splitlines() if ln.strip()), "unknown error")
+            print_warning(f"  Restore as '{cred_user}' failed: {first_line}")
+
         if not restored:
             print_error(f"Failed to restore {sql_file} with any known credentials.")
+            if last_err.strip():
+                print_error(f"Last mysql error:\n{last_err.strip()}")
+            print_error("Likely causes: wrong password in .env, MySQL still")
+            print_error("initialising (initdb scripts create users/databases after")
+            print_error("first start), or the dump file is empty/corrupt.")
             return False
     return True
 
@@ -2074,7 +2759,7 @@ def _restore_mysql_local(db_dir, svc, entries):
     candidates = []
     if user and user_pwd:
         candidates.append((user, user_pwd))
-    if root_pwd:
+    if root_pwd and ("root", root_pwd) not in candidates:
         candidates.append(("root", root_pwd))
 
     for db, sql_file, _, _ in entries:
@@ -2083,20 +2768,59 @@ def _restore_mysql_local(db_dir, svc, entries):
             print_error(f"Refusing unsafe manifest entry {sql_file!r} — path traversal is not allowed.")
             return False
         print_info(f"Restoring {db} from {sql_file}  (may take a while)...")
+
+        # v4.2.2 — same --databases-detection + subshell-prepend fix as
+        # _restore_mysql_remote. See comment there for the full rationale.
+        dump_path = os.path.join(PASARGUARD_DIR, db_dir, sql_file)
+        try:
+            with open(dump_path, "r", errors="replace") as _df:
+                head_text = "".join(iter(lambda: _df.readline(), ""))
+                # Read up to 20 lines to detect the CREATE DATABASE.
+                head_text += _df.read(64 * 1024)  # first ~64KB covers the header
+        except OSError:
+            head_text = ""
+        dump_has_create_db = "CREATE DATABASE" in head_text
+
         restored = False
+        last_err = ""
         for cred_user, cred_pwd in candidates:
-            # v4.2 fix: same MYSQL_PWD-via-exec-e fix as the remote path.
             env_flag = f"-e MYSQL_PWD={shlex.quote(cred_pwd)} " if cred_pwd else ""
-            cmd = (
-                f"cd {PASARGUARD_DIR} && cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
-                f"docker compose exec -T {env_flag}{shlex.quote(svc)} mysql -u {shlex.quote(cred_user)}"
-            )
-            if run_command(cmd, quiet=True):
+            if dump_has_create_db:
+                cmd = (
+                    f"cd {PASARGUARD_DIR} && "
+                    f"cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} | "
+                    f"docker compose exec -T {env_flag}{shlex.quote(svc)} "
+                    f"mysql -u {shlex.quote(cred_user)}"
+                )
+            else:
+                create_echo = (
+                    f"echo 'CREATE DATABASE IF NOT EXISTS `{db}` "
+                    f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;'"
+                )
+                use_echo = f"echo 'USE `{db}`;'"
+                cmd = (
+                    f"cd {PASARGUARD_DIR} && "
+                    f"( {create_echo} ; {use_echo} ; "
+                    f"cat {shlex.quote(db_dir)}/{shlex.quote(sql_file)} ) | "
+                    f"docker compose exec -T {env_flag}{shlex.quote(svc)} "
+                    f"mysql -u {shlex.quote(cred_user)}"
+                )
+            try:
+                subprocess.run(cmd, shell=True, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               cwd=PASARGUARD_DIR)
                 print_success(f"Restored using credentials for user '{cred_user}'.")
                 restored = True
                 break
+            except subprocess.CalledProcessError as e:
+                last_err = e.stderr.decode("utf-8", errors="replace").strip() if e.stderr else ""
+                first_line = next((ln for ln in last_err.splitlines() if ln.strip()), "unknown error")
+                print_warning(f"  Restore as '{cred_user}' failed: {first_line}")
+
         if not restored:
             print_error(f"Failed to restore {sql_file} with any known credentials.")
+            if last_err:
+                print_error(f"Last mysql error:\n{last_err}")
             return False
     return True
 
@@ -2179,6 +2903,18 @@ def workflow_transfer():
     zip_path = create_backup(include_node)
     if not zip_path or not os.path.exists(zip_path):
         print_error("Aborting — backup failed.")
+        return
+
+    # v4.2.4 — verify the archive actually contains a usable manifest
+    # BEFORE we spend time uploading it, wiping the destination server,
+    # and only THEN discovering the restore has nothing to work with.
+    # This is the same check the remote side does, run locally first so
+    # a broken backup fails fast with the local files still on disk to
+    # inspect, instead of failing after the destination is already wiped.
+    if not _verify_zip_has_manifest(zip_path):
+        print_error("Aborting — refusing to transfer a backup with no usable "
+                     "database manifest. Re-run 'Manual Backup' and check the "
+                     "'Exporting database...' step above for errors.")
         return
 
     print()
@@ -2312,8 +3048,24 @@ def workflow_transfer():
             print_error(f"Could not determine the {remote_backend['type']} container for restore.")
             return
 
+        # v4.2.3 — wipe MySQL data dir BEFORE starting the container so it
+        # re-inits with the credentials from the new .env. MySQL only reads
+        # MYSQL_ROOT_PASSWORD on first init; stale data on a bind mount
+        # (the typical PasarGuard install) survives `docker compose down -v`
+        # and would silently keep the OLD password, causing 1045 during
+        # restore. This must run after the zip is extracted (so we see the
+        # new docker-compose.yml) and before start_compose_ssh starts MySQL.
+        if remote_backend["type"] in ("mysql", "mariadb"):
+            _wipe_mysql_data_remote(ssh, remote_db_svc)
+
+        # v4.2.2 — pass backend_type so wait_db_* picks the right readiness
+        # probe (pg_isready for postgres/timescaledb, mysqladmin ping for
+        # mysql/mariadb). Previously wait_postgres=True hard-coded pg_isready
+        # which doesn't exist in a mysql image, so the wait always timed out
+        # and the whole transfer aborted with 'mysql did not start'.
         if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB",
-                                  services=[remote_db_svc], wait_postgres=True):
+                                  services=[remote_db_svc], wait_db=True,
+                                  backend_type=remote_backend["type"]):
             print_error(f"{remote_db_svc} did not start. Aborting.")
             return
 
@@ -2481,6 +3233,14 @@ def workflow_manual_restore():
         print_error(f"File '{zip_name}' not found in current directory.")
         return
 
+    # v4.2.4 — same sanity check as the transfer workflow: fail fast on a
+    # backup with no usable manifest, BEFORE stopping containers and
+    # wiping the current install's directories.
+    if not _verify_zip_has_manifest(zip_name):
+        print_error("Aborting — refusing to restore a backup with no usable "
+                     "database manifest. Current install has NOT been touched.")
+        return
+
     confirm = input(
         f"  {C.R1}> WARNING: This will overwrite current config and database. Continue? (y/n): {C.RESET}"
     ).strip().lower()
@@ -2552,8 +3312,19 @@ def workflow_manual_restore():
             raise Exception(f"Could not determine the {backend['type']} container for restore.")
         print_info(f"Detected database service: {local_db_svc}")
 
+        # v4.2.3 — same MySQL data-dir wipe as workflow_transfer (see
+        # _wipe_mysql_data_remote for the full rationale). MySQL only
+        # honours MYSQL_ROOT_PASSWORD on first init, so a stale data dir
+        # on a bind mount would keep the old password and 1045 the restore.
+        if backend["type"] in ("mysql", "mariadb"):
+            _wipe_mysql_data_local(local_db_svc)
+
+        # v4.2.2 — same backend-aware wait fix as workflow_transfer (see
+        # comment there). wait_db_local dispatches by backend_type instead
+        # of unconditionally running pg_isready.
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard DB",
-                                    services=[local_db_svc], wait_postgres=True):
+                                    services=[local_db_svc], wait_db=True,
+                                    backend_type=backend["type"]):
             raise Exception(f"{local_db_svc} did not start")
 
         if not _restore_databases_local("db_dump", local_db_svc, backend_type=backend["type"]):
