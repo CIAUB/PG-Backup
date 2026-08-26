@@ -6,7 +6,7 @@
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;All+5+Backends+Auto--Detected;Hardened+%26+Security--Audited" alt="Typing SVG" />
 
-![Version](https://img.shields.io/badge/Version-v4.2.8-8B0000)
+![Version](https://img.shields.io/badge/Version-v4.2.9-8B0000)
 ![Python](https://img.shields.io/badge/Python-3.8+-8B0000)
 ![Platform](https://img.shields.io/badge/Platform-Linux-8B0000)
 ![Docker](https://img.shields.io/badge/Docker-Supported-8B0000)
@@ -18,6 +18,10 @@
 ![Multi-DB](https://img.shields.io/badge/Multi--Database-Auto--Detected-8B0000)
 
 Backup • Restore • Migration • Telegram Automation • All 5 Backends • Docker
+
+<a href="https://nowpayments.io/donation?api_key=8c82355a-a1cc-48c3-ac79-d5859636ff45" target="_blank" rel="noreferrer noopener">
+    <img src="https://nowpayments.io/images/embeds/donation-button-black.svg" alt="Crypto donation button by NOWPayments">
+</a>
 
 </div>
 
@@ -37,7 +41,7 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 
 **PG-Backup** یک ابزار حرفه‌ای برای تهیه نسخه پشتیبان، ریستور و مهاجرت سرویس‌های **PasarGuard** و **PG-Node** است — با تشخیص خودکار بک‌اند، انتقال کامل بین سرورها، ارسال خودکار به تلگرام و بازیابی سریع.
 
-> 🆕 **v4.2.8** — یکسان‌سازی کامل احراز هویت PostgreSQL/TimescaleDB بین بکاپ، ریستور و enumeration دیتابیس‌ها: کاربر و رمز واقعی همیشه از `.env` یا (در نبود آن) از بلاک `environment:` سرویس در `docker-compose.yml` خوانده می‌شوند — با اولویت به نام سرویسی که واقعاً تشخیص داده شده، نه یک فهرست حدسیِ ثابت. قبلاً بکاپ Postgres/TimescaleDB بدون رمز و با کاربر هاردکد اجرا می‌شد و در نصب‌های password-enforced یا با کاربر/نام سرویس سفارشی، می‌توانست fail شود یا اشتباه دیتابیس تشخیص دهد. جزئیات در [📜 تغییرات نسخه](#-تغییرات-نسخه) و [🔐 امنیت](#-امنیت-security).
+> 🆕 **v4.2.9** — رفع باگ مسیر نسبی `db_dump` در **Manual Restore (محلی)**: ریستور دیتابیس محلی، مسیر manifest را نسبت به دایرکتوری فعلی اجرای اسکریپت جست‌وجو می‌کرد نه `/opt/pasarguard`، و در نتیجه با خطای کاذب «manifest.tsv not found» متوقف می‌شد حتی وقتی استخراج آرشیو کاملاً موفق بود. اکنون مسیر همیشه مطلق (`/opt/pasarguard/db_dump`) resolve می‌شود — برای **هر پنج بک‌اند** (SQLite، PostgreSQL، TimescaleDB، MySQL، MariaDB). جزئیات در [📜 تغییرات نسخه](#-تغییرات-نسخه).
 
 ---
 
@@ -55,6 +59,7 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 * 🛡️ سخت‌گیری امنیتی کامل: بدون command injection، بدون Zip-Slip، بدون credential leak
 * ✅ **بررسی سلامت آرشیو پیش از هر عملیات مخرب** (v4.2.4) — یک بکاپ ناقص هرگز باعث پاک‌شدن سرور مقصد یا نصب فعلی نمی‌شود
 * 🔑 **احراز هویت واقعی Postgres/TimescaleDB در بکاپ و enumeration** (v4.2.5 – v4.2.8) — کاربر/رمز از `.env` یا `docker-compose.yml`، با پشتیبانی از نام سرویس و کاربر سفارشی
+* 🧭 **Manual Restore محلی با مسیر manifest مطلق** (v4.2.9) — دیگر وابسته به دایرکتوری اجرای اسکریپت نیست
 
 ---
 
@@ -237,6 +242,7 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 
 آخرین تغییرات مهم:
 
+* **v4.2.9** — رفع مسیر نسبی `db_dump` در ریستور محلی (`workflow_manual_restore`): فراخوانی‌های ریستور دیتابیس به‌جای مسیر مطلق `PASARGUARD_DIR/db_dump`، رشته‌ی نسبی `"db_dump"` را پاس می‌دادند که نسبت به دایرکتوری فعلی اجرای اسکریپت resolve می‌شد نه `/opt/pasarguard`. نتیجه: خطای کاذب «manifest.tsv not found» روی هر اجرای Manual Restore از مسیری غیر از `/opt/pasarguard` — برای هر پنج بک‌اند. مسیر انتقال (SSH) از قبل درست بود.
 * **v4.2.8** — پاس دادن `PGPASSWORD` واقعی به `pg_dumpall`/`pg_dump` در بکاپ محلی (نه فقط در ریستور)، همراه با اولویت‌دادن به نام سرویس compose تشخیص‌داده‌شده هنگام fallback به `docker-compose.yml`.
 * **v4.2.7** — پاس‌ورد resolve‌شده اکنون در enumeration دیتابیس‌های Postgres هم forward می‌شود؛ رفع سقوط بی‌صدا به حدس تک‌دیتابیسی روی نصب‌های password-enforced.
 * **v4.2.6** — رفع تشخیص کاربر سفارشی Postgres در enumeration؛ دیگر با `-U pasarguard` هاردکد fail نمی‌شود.
@@ -267,6 +273,7 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 | مهاجرت با manifest ناقص | کشف خطا فقط بعد از پاک‌شدن سرور مقصد | بررسی محلی آرشیو پیش از هر عملیات مخرب |
 | بکاپ Postgres/TimescaleDB بدون رمز | فقط `backend["user"]` بدون پاس‌ورد؛ روی نصب password-enforced fail می‌شد | `PGPASSWORD` resolve‌شده از `.env`/`docker-compose.yml` به `pg_dump`/`pg_dumpall` پاس داده می‌شود (v4.2.8) |
 | enumeration دیتابیس با کاربر/سرویس سفارشی | کاربر `pasarguard` و نام سرویس‌های حدسی هاردکد بودند | کاربر/رمز واقعی resolve‌شده + اولویت به نام سرویس تشخیص‌داده‌شده (v4.2.5 – v4.2.8) |
+| مسیر manifest در ریستور محلی | مسیر نسبی `"db_dump"` وابسته به دایرکتوری اجرای اسکریپت بود | مسیر مطلق `PASARGUARD_DIR/db_dump` برای هر ۵ بک‌اند (v4.2.9) |
 
 > ⚠️ **نکته‌ی باز**: اتصال SSH از `AutoAddPolicy` استفاده می‌کند (پذیرش خودکار کلید میزبان، با هشدار صریح) — ریسک تئوریک MITM روی شبکه‌های نامطمئن. توصیه: فقط از شبکه‌های قابل‌اعتماد اجرا کنید یا کلید میزبان را از قبل دستی verify کنید.
 
@@ -297,11 +304,10 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 
 ### ❤️ حمایت از پروژه
 
-اگر این پروژه برای شما مفید بوده است، با ثبت ⭐ در GitHub از توسعه آن حمایت کنید.
+اگر این پروژه برای شما مفید بوده است، با ثبت ⭐ در GitHub یا با دونیت کریپتویی از بالای صفحه از توسعه آن حمایت کنید.
 
 ---
 
 <sub><sub>Developed by CIAUB</sub></sub>
 
 </div>
-
