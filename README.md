@@ -16,10 +16,6 @@
 ![MySQL](https://img.shields.io/badge/MySQL-Supported-8B0000)
 ![MariaDB](https://img.shields.io/badge/MariaDB-Supported-8B0000)
 ![Multi-DB](https://img.shields.io/badge/Multi--Database-Auto--Detected-8B0000)
-![Telegram](https://img.shields.io/badge/Telegram-Automation-8B0000)
-![SSH](https://img.shields.io/badge/SSH-Migration-8B0000)
-![Security](https://img.shields.io/badge/Security-Hardened-8B0000)
-![License](https://img.shields.io/badge/License-MIT-8B0000)
 
 Backup • Restore • Migration • Telegram Automation • All 5 Backends • Docker
 
