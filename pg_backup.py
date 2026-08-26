@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v4.2.8
+#   Pasarguard Backup Utility  v4.2.9
 #   Dev by: CIA 
 #   GitHub: https://github.com/CIAUB
-#   v4.2.8 — PostgreSQL/TimescaleDB credential parity pass:
+#   v4.2.9 — Manual Restore db_dump path fix:
+#          * workflow_manual_restore's local database-restore calls passed
+#            the relative path "db_dump" into _restore_databases_local, so
+#            the manifest lookup was resolved against the script's current
+#            working directory instead of PASARGUARD_DIR. Any local
+#            restore run from a directory other than /opt/pasarguard (the
+#            normal case, since that's where the .zip usually is) failed
+#            with 'manifest.tsv not found or empty — db_dump does not
+#            exist locally' even though extraction had succeeded and
+#            /opt/pasarguard/db_dump was populated correctly. Both call
+#            sites (SQLite and Postgres/TimescaleDB/MySQL/MariaDB) now
+#            pass os.path.join(PASARGUARD_DIR, "db_dump"), fixing local
+#            restore for every supported backend. The SSH-based transfer
+#            workflow was unaffected — it already resolved this path via
+#            PASARGUARD_DIR on the remote host.
 #          * _backup_postgres_local now resolves creds via
 #            _resolve_pg_credentials() (.env, then docker-compose.yml
 #            fallback) and passes PGPASSWORD into pg_dumpall/pg_dump,
@@ -485,7 +499,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 2 . 8   -   C I A U B" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 2 . 9   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
@@ -3519,7 +3533,7 @@ def workflow_manual_restore():
         )
 
         if backend["type"] == "sqlite":
-            if not _restore_databases_local("db_dump", None, backend_type="sqlite"):
+            if not _restore_databases_local(os.path.join(PASARGUARD_DIR, "db_dump"), None, backend_type="sqlite"):
                 raise Exception("SQLite restore failed.")
             if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
                 raise Exception("Pasarguard did not start")
@@ -3549,7 +3563,7 @@ def workflow_manual_restore():
                                     backend_type=backend["type"]):
             raise Exception(f"{local_db_svc} did not start")
 
-        if not _restore_databases_local("db_dump", local_db_svc, backend_type=backend["type"]):
+        if not _restore_databases_local(os.path.join(PASARGUARD_DIR, "db_dump"), local_db_svc, backend_type=backend["type"]):
             raise Exception("Database restore failed.")
 
         if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
