@@ -2,6 +2,12 @@
 
 <div dir="rtl">
 
+## v4.2.9 — رفع مسیر نسبی db_dump در Manual Restore محلی
+
+* `workflow_manual_restore` هنگام ریستور دیتابیس، مسیر نسبی `"db_dump"` را به `_restore_databases_local` پاس می‌داد (هم برای SQLite و هم برای Postgres/TimescaleDB/MySQL/MariaDB). این مسیر توسط `_read_manifest`/`_diagnose_missing_manifest` مستقیماً با `os.path` باز می‌شد، پس نسبت به **دایرکتوری فعلی اجرای اسکریپت** resolve می‌شد، نه `/opt/pasarguard`. نتیجه: هر اجرای Manual Restore از مسیری غیر از خودِ `/opt/pasarguard` (رایج‌ترین حالت، چون فایل ZIP معمولاً جای دیگری است) با خطای کاذب «manifest.tsv not found or empty — db_dump does not exist locally» متوقف می‌شد، حتی وقتی استخراج آرشیو کاملاً موفق بود و `/opt/pasarguard/db_dump` پر از داده‌ی درست بود.
+* هر دو محل فراخوانی اکنون `os.path.join(PASARGUARD_DIR, "db_dump")` پاس می‌دهند، یعنی مسیر همیشه مطلق است — مستقل از دایرکتوری اجرای اسکریپت. این فیکس هر پنج بک‌اند را پوشش می‌دهد چون `_restore_databases_local` نقطه‌ی مشترک ورودی برای همه‌شان است.
+* مسیر Auto Transfer (SSH) از قبل درست بود، چون `_read_manifest_remote` صریحاً `PASARGUARD_DIR` را روی سرور ریموت پیش از هر دستور `cd` می‌کرد.
+
 ## v4.2.8 — یکسان‌سازی احراز هویت PostgreSQL/TimescaleDB
 
 * `_backup_postgres_local` اکنون credential ها را از طریق `_resolve_pg_credentials()` (اول `.env`، سپس فال‌بک به `docker-compose.yml`) می‌خواند و `PGPASSWORD` را به `pg_dumpall`/`pg_dump` پاس می‌دهد — دقیقاً هماهنگ با چیزی که ریستور قبلاً انجام می‌داد. قبلاً بکاپ فقط از `backend["user"]` بدون هیچ رمزی استفاده می‌کرد، پس در هر نصبی که auth با رمز را اجباری کرده بود، یا `POSTGRES_USER`/`POSTGRES_PASSWORD` فقط در `docker-compose.yml` بود (نه `.env`)، بکاپ می‌توانست fail شود یا کاربر را اشتباه تشخیص دهد؛ حتی وقتی ریستور همان نصب درست کار می‌کرد.
