@@ -25,9 +25,9 @@ DEVELOPER="CIAUB"
 VERSION_TAG="${1:-}"   # optional: pass a tag (e.g. v4.2.1 or 4.2.1) to pin that version
 
 # Accept version from both forms:
-#   bash install.sh 4.2.1        → $1 = 4.2.1
-#   bash -c "$(curl ...)" 4.2.1  → $0 = 4.2.1 (bash -c name slot)
-#   bash install.sh              → VERSION_TAG stays empty (latest from main)
+#   bash install.sh 4.2.1        -> $1 = 4.2.1
+#   bash -c "$(curl ...)" 4.2.1  -> $0 = 4.2.1 (bash -c name slot)
+#   bash install.sh              -> VERSION_TAG stays empty (latest from main)
 if [ -z "${VERSION_TAG}" ] && [[ "${0}" =~ ^[vV]?[0-9]+(\.[0-9]+){1,2}$ ]]; then
   VERSION_TAG="${0}"
 fi
@@ -54,19 +54,48 @@ fi
 pip3 install --break-system-packages requests urllib3 paramiko >/dev/null 2>&1 || \
 pip3 install requests urllib3 paramiko >/dev/null 2>&1 || true
 
-# ── Pick source: pinned tag, local copy, or main branch ──────────────────────
+# ── Pick source: pinned tag, explicit local offline copy, or main branch ─────
+# v4.2.5 fix: the previous version silently reused ANY pg_backup.py sitting
+# in the current working directory when no version tag was given — including
+# when the installer was run via `bash -c "$(curl ...)"` from README, where
+# $0 is literally "bash" and `dirname "$0"` resolves to ".". If a user
+# happened to run the one-liner from a directory that had an old
+# pg_backup.py left over (a previous manual download, an old git clone,
+# a stale file from testing), the "official" installer would silently
+# install THAT stale file instead of fetching the current version from
+# GitHub — with no warning printed. That directly defeats the purpose of
+# "Update to Latest Version".
+#
+# Offline installs (install.sh + pg_backup.py shipped together, no network)
+# are still supported, but now require an explicit `--offline` flag instead
+# of being auto-detected by directory sniffing, so a curl-piped invocation
+# can never accidentally take this path.
+OFFLINE=0
+for arg in "$@"; do
+  [ "${arg}" = "--offline" ] && OFFLINE=1
+done
+
 if [ -n "${VERSION_TAG}" ]; then
   SOURCE="${RAW_BASE}/${VERSION_TAG}/pg_backup.py"
-elif [ -f "$(dirname "$0")/pg_backup.py" ]; then
-  # Offline / local install when pg_backup.py sits next to install.sh
+  echo -e "${GREEN}[*] Source: pinned tag ${VERSION_TAG}${NC}"
+elif [ "${OFFLINE}" -eq 1 ] && [ -f "$(dirname "$0")/pg_backup.py" ]; then
   cp "$(dirname "$0")/pg_backup.py" "${TMP_PATH}"
   SOURCE=""
+  echo -e "${GREEN}[*] Source: local offline copy ($(dirname "$0")/pg_backup.py)${NC}"
+elif [ "${OFFLINE}" -eq 1 ]; then
+  echo -e "${RED}[-] --offline given but no pg_backup.py found next to install.sh.${NC}"
+  exit 1
 else
   SOURCE="${RAW_BASE}/main/pg_backup.py?v=$(date +%s)"
+  echo -e "${GREEN}[*] Source: latest from 'main' branch${NC}"
 fi
 
 if [ -n "${SOURCE}" ]; then
-  curl -fsSL "${SOURCE}" -o "${TMP_PATH}"
+  if ! curl -fsSL "${SOURCE}" -o "${TMP_PATH}"; then
+    echo -e "${RED}[-] Download failed: ${SOURCE}${NC}"
+    echo -e "${RED}[-] Check your network connection and that the tag/branch exists.${NC}"
+    exit 1
+  fi
 fi
 
 if [ ! -s "${TMP_PATH}" ]; then
