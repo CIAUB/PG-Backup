@@ -6,7 +6,7 @@
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;All+5+Backends+Auto--Detected;Hardened+%26+Security--Audited" alt="Typing SVG" />
 
-![Version](https://img.shields.io/badge/Version-v4.2.4-8B0000)
+![Version](https://img.shields.io/badge/Version-v4.2.8-8B0000)
 ![Python](https://img.shields.io/badge/Python-3.8+-8B0000)
 ![Platform](https://img.shields.io/badge/Platform-Linux-8B0000)
 ![Docker](https://img.shields.io/badge/Docker-Supported-8B0000)
@@ -37,7 +37,7 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 
 **PG-Backup** یک ابزار حرفه‌ای برای تهیه نسخه پشتیبان، ریستور و مهاجرت سرویس‌های **PasarGuard** و **PG-Node** است — با تشخیص خودکار بک‌اند، انتقال کامل بین سرورها، ارسال خودکار به تلگرام و بازیابی سریع.
 
-> 🆕 **v4.2.4** — رفع کامل خانواده‌ی خطای `manifest.tsv not found` در مهاجرت به سرور جدید (بررسی محلی آرشیو *قبل* از آپلود و پاک‌شدن سرور مقصد) + رفع ریشه‌ای خطای `1045 Access denied` روی MySQL/MariaDB (تشخیص و پاک‌سازی صحیح bind mount در برابر named volume، پیش از init مجدد). جزئیات در [📜 تغییرات نسخه](#-تغییرات-نسخه) و [🔐 امنیت](#-امنیت-security).
+> 🆕 **v4.2.8** — یکسان‌سازی کامل احراز هویت PostgreSQL/TimescaleDB بین بکاپ، ریستور و enumeration دیتابیس‌ها: کاربر و رمز واقعی همیشه از `.env` یا (در نبود آن) از بلاک `environment:` سرویس در `docker-compose.yml` خوانده می‌شوند — با اولویت به نام سرویسی که واقعاً تشخیص داده شده، نه یک فهرست حدسیِ ثابت. قبلاً بکاپ Postgres/TimescaleDB بدون رمز و با کاربر هاردکد اجرا می‌شد و در نصب‌های password-enforced یا با کاربر/نام سرویس سفارشی، می‌توانست fail شود یا اشتباه دیتابیس تشخیص دهد. جزئیات در [📜 تغییرات نسخه](#-تغییرات-نسخه) و [🔐 امنیت](#-امنیت-security).
 
 ---
 
@@ -54,6 +54,7 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 * 🔐 انتقال امن از طریق SSH با رمز `getpass` (بدون echo)
 * 🛡️ سخت‌گیری امنیتی کامل: بدون command injection، بدون Zip-Slip، بدون credential leak
 * ✅ **بررسی سلامت آرشیو پیش از هر عملیات مخرب** (v4.2.4) — یک بکاپ ناقص هرگز باعث پاک‌شدن سرور مقصد یا نصب فعلی نمی‌شود
+* 🔑 **احراز هویت واقعی Postgres/TimescaleDB در بکاپ و enumeration** (v4.2.5 – v4.2.8) — کاربر/رمز از `.env` یا `docker-compose.yml`، با پشتیبانی از نام سرویس و کاربر سفارشی
 
 ---
 
@@ -64,7 +65,7 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 | بک‌اند | بکاپ | ریستور |
 | --- | --- | --- |
 | **SQLite** | کپی فایل `db.sqlite3` | کپی با مسیر مقصد validate‌شده |
-| **PostgreSQL** | `pg_dump` + `pg_dumpall` (همه‌ی DBها) | `psql` (per-database) |
+| **PostgreSQL** | `pg_dump` + `pg_dumpall` (همه‌ی DBها، با کاربر/رمز resolve‌شده) | `psql` (per-database، با کاربر/رمز resolve‌شده) |
 | **TimescaleDB** | مثل PostgreSQL + ثبت نسخه‌ی extension | `psql` (per-database) |
 | **MySQL / MariaDB** | `mysqldump --databases` (خودکفا، شامل `CREATE DATABASE`) | `mysql` با fallback خودکار چند credential |
 
@@ -78,6 +79,10 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
         │
         ▼
 Validate نام سرویس Docker  →  انتخاب ابزار و کانتینر مناسب
+        │
+        ▼
+Resolve کاربر/رمز واقعی: .env  →  (fallback) بلاک environment: سرویس در
+docker-compose.yml — با اولویت نام سرویس تشخیص‌داده‌شده (v4.2.5 – v4.2.8)
 ```
 
 ---
@@ -120,6 +125,9 @@ PG-Backup
 
 ```text
 Detect Backend Auto
+        │
+        ▼
+Resolve Postgres/MySQL Credentials (.env → docker-compose.yml fallback)  (v4.2.5 – v4.2.8)
         │
         ▼
 Create Multi-DB Backup (tmp dir خصوصی 0700)
@@ -229,6 +237,10 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 
 آخرین تغییرات مهم:
 
+* **v4.2.8** — پاس دادن `PGPASSWORD` واقعی به `pg_dumpall`/`pg_dump` در بکاپ محلی (نه فقط در ریستور)، همراه با اولویت‌دادن به نام سرویس compose تشخیص‌داده‌شده هنگام fallback به `docker-compose.yml`.
+* **v4.2.7** — پاس‌ورد resolve‌شده اکنون در enumeration دیتابیس‌های Postgres هم forward می‌شود؛ رفع سقوط بی‌صدا به حدس تک‌دیتابیسی روی نصب‌های password-enforced.
+* **v4.2.6** — رفع تشخیص کاربر سفارشی Postgres در enumeration؛ دیگر با `-U pasarguard` هاردکد fail نمی‌شود.
+* **v4.2.5** — کشف credential از بلاک `environment:` در `docker-compose.yml` (علاوه بر `.env`) برای Postgres و MySQL.
 * **v4.2.4** — رفع ریشه‌ای «manifest.tsv not found» در مهاجرت: آرشیو بکاپ پیش از هر عملیات مخرب به‌صورت محلی اعتبارسنجی می‌شود.
 * **v4.2.3** — رفع `1045 Access denied` در ریستور MySQL/MariaDB با تشخیص و پاک‌سازی صحیح data-dir مقصد.
 * **v4.2.2** — رفع خواندن manifest از سرور ریموت + انتظار آماده‌شدن دیتابیس بر اساس نوع بک‌اند.
@@ -253,6 +265,8 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 | نام Instance/سرویس | بدون validation در `shell=True` | regex سخت‌گیرانه + `shlex.quote()` |
 | MySQL data-dir مقصد | بین دو مهاجرت رمز عوض نمی‌شد → `1045` | تشخیص و پاک‌سازی bind mount/volume پیش از init |
 | مهاجرت با manifest ناقص | کشف خطا فقط بعد از پاک‌شدن سرور مقصد | بررسی محلی آرشیو پیش از هر عملیات مخرب |
+| بکاپ Postgres/TimescaleDB بدون رمز | فقط `backend["user"]` بدون پاس‌ورد؛ روی نصب password-enforced fail می‌شد | `PGPASSWORD` resolve‌شده از `.env`/`docker-compose.yml` به `pg_dump`/`pg_dumpall` پاس داده می‌شود (v4.2.8) |
+| enumeration دیتابیس با کاربر/سرویس سفارشی | کاربر `pasarguard` و نام سرویس‌های حدسی هاردکد بودند | کاربر/رمز واقعی resolve‌شده + اولویت به نام سرویس تشخیص‌داده‌شده (v4.2.5 – v4.2.8) |
 
 > ⚠️ **نکته‌ی باز**: اتصال SSH از `AutoAddPolicy` استفاده می‌کند (پذیرش خودکار کلید میزبان، با هشدار صریح) — ریسک تئوریک MITM روی شبکه‌های نامطمئن. توصیه: فقط از شبکه‌های قابل‌اعتماد اجرا کنید یا کلید میزبان را از قبل دستی verify کنید.
 
@@ -290,3 +304,4 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 <sub><sub>Developed by CIAUB</sub></sub>
 
 </div>
+
