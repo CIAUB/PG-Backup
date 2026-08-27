@@ -1,21 +1,43 @@
-MIT License
-
 Copyright (c) 2026 CIAUB
+All Rights Reserved (with limited permissions below)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This work is licensed under the Creative Commons
+Attribution-NonCommercial-NoDerivatives 4.0 International License (CC BY-NC-ND 4.0).
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+You are free to:
+  - Use this software for your own personal or internal purposes, free of charge.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+Under the following strict terms:
+
+  1. Attribution — You must give appropriate credit to the original author (CIAUB)
+     and provide a link to the original repository:
+     https://github.com/CIAUB/PG-Backup
+
+  2. NonCommercial — You may NOT sell this software, host it as a paid service,
+     or use it for any commercial purpose whatsoever.
+
+  3. NoDerivatives — You may NOT modify, fork, redistribute, republish, mirror,
+     or create derivative works based on this software. This includes, but is
+     not limited to, uploading copies or modified versions to GitHub, GitLab,
+     npm, PyPI, or any other code hosting or package distribution platform.
+
+  4. No Re-licensing — You may NOT relicense, sublicense, or claim authorship
+     of this software or any part of it, in whole or in part.
+
+Any violation of these terms immediately and automatically terminates your
+rights to use this software.
+
+Violators may be reported to the relevant hosting platform (e.g. GitHub DMCA
+takedown process) and may be subject to legal action under applicable
+copyright law.
+
+Full legal text of the CC BY-NC-ND 4.0 license:
+https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode
+
+---
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
