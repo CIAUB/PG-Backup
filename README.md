@@ -19,6 +19,12 @@
 
 Backup • Restore • Migration • Telegram Automation • All 5 Backends • Docker
 
+![License](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-8B0000)
+
+> ⚠️ **این پروژه تحت لایسنس CC BY-NC-ND 4.0 منتشر شده است.**
+> استفاده‌ی رایگان مجاز است، اما **کپی، فورک، تغییر، بازنشر یا فروش آن به هر شکل ممنوع است.**
+> جزئیات کامل: [بخش لایسنس](#-لایسنس) یا فایل [LICENSE](LICENSE)
+
 <a href="https://nowpayments.io/donation?api_key=8c82355a-a1cc-48c3-ac79-d5859636ff45" target="_blank" rel="noreferrer noopener">
     <img src="https://nowpayments.io/images/embeds/donation-button-black.svg" alt="Crypto donation button by NOWPayments">
 </a>
@@ -300,7 +306,36 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 * 👨‍💻 Telegram: https://t.me/CIAUB
 * 🐙 GitHub: https://github.com/CIAUB
 
+* ---
+
+# 📜 لایسنس
+
+این پروژه تحت لایسنس **Creative Commons Attribution-NonCommercial-NoDerivatives 4.0
+(CC BY-NC-ND 4.0)** منتشر شده است.
+
+## ✅ چه کاری مجاز است؟
+- استفاده‌ی شخصی یا داخلی از این نرم‌افزار، **کاملاً رایگان**.
+
+## ❌ چه کاری ممنوع است؟
+| ممنوعیت | توضیح |
+| --- | --- |
+| 🚫 فروش | فروش نرم‌افزار یا میزبانی آن به‌عنوان سرویس پولی ممنوع است. |
+| 🚫 کپی / فورک | آپلود کپی یا نسخه‌ی این پروژه در GitHub، GitLab یا هر پلتفرم دیگر ممنوع است. |
+| 🚫 تغییر و بازنشر | ساخت و انتشار نسخه‌ی تغییریافته (Derivative Work) ممنوع است. |
+| 🚫 ادعای مالکیت | حذف یا جایگزینی نام توسعه‌دهنده‌ی اصلی (CIAUB) در فایل LICENSE ممنوع است. |
+
+## ⚖️ ضمانت اجرا
+نقض هر یک از شرایط بالا، به‌صورت خودکار حق استفاده از این نرم‌افزار را باطل می‌کند.
+موارد نقض ممکن است از طریق فرآیند **DMCA Takedown** به پلتفرم میزبان (مثل GitHub)
+گزارش شده و طبق قوانین کپی‌رایت پیگیری قانونی شوند.
+
+متن کامل و رسمی لایسنس:
+👉 [creativecommons.org/licenses/by-nc-nd/4.0/legalcode](https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode)
+
+فایل لایسنس این ریپازیتوری: [LICENSE](LICENSE)
+
 ---
+
 
 ### ❤️ حمایت از پروژه
 
