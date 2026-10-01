@@ -25,7 +25,7 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 > استفاده‌ی رایگان مجاز است، اما **کپی، فورک، تغییر، بازنشر یا فروش آن به هر شکل ممنوع است.**
 > جزئیات کامل: [بخش لایسنس](#-لایسنس) یا فایل [LICENSE](LICENSE)
 
-<a href="https://nowpayments.io/donation?api_key=8c82355a-a1cc-48c3-ac79-d5859636ff45" target="_blank" rel="noreferrer noopener">
+<a href="https://nowpayments.io/embeds/donation-widget?api_key=8373139c-0aec-4e38-b34c-88dd005cfc1c" target="_blank" rel="noreferrer noopener">
     <img src="https://nowpayments.io/images/embeds/donation-button-black.svg" alt="Crypto donation button by NOWPayments">
 </a>
 
@@ -73,12 +73,12 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 
 نوع دیتابیس به‌صورت خودکار از `/opt/pasarguard/.env` و `docker-compose.yml` تشخیص داده می‌شود:
 
-| بک‌اند | بکاپ | ریستور |
-| --- | --- | --- |
-| **SQLite** | کپی فایل `db.sqlite3` | کپی با مسیر مقصد validate‌شده |
-| **PostgreSQL** | `pg_dump` + `pg_dumpall` (همه‌ی DBها، با کاربر/رمز resolve‌شده) | `psql` (per-database، با کاربر/رمز resolve‌شده) |
-| **TimescaleDB** | مثل PostgreSQL + ثبت نسخه‌ی extension | `psql` (per-database) |
-| **MySQL / MariaDB** | `mysqldump --databases` (خودکفا، شامل `CREATE DATABASE`) | `mysql` با fallback خودکار چند credential |
+| بک‌اند              | بکاپ                                                            | ریستور                                          |
+| ------------------- | --------------------------------------------------------------- | ----------------------------------------------- |
+| **SQLite**          | کپی فایل `db.sqlite3`                                           | کپی با مسیر مقصد validate‌شده                   |
+| **PostgreSQL**      | `pg_dump` + `pg_dumpall` (همه‌ی DBها، با کاربر/رمز resolve‌شده) | `psql` (per-database، با کاربر/رمز resolve‌شده) |
+| **TimescaleDB**     | مثل PostgreSQL + ثبت نسخه‌ی extension                           | `psql` (per-database)                           |
+| **MySQL / MariaDB** | `mysqldump --databases` (خودکفا، شامل `CREATE DATABASE`)        | `mysql` با fallback خودکار چند credential       |
 
 ### فرآیند تشخیص
 
@@ -217,10 +217,10 @@ backup_full_YYYYMMDDHHMMSS.zip
 
 # 📂 مسیرهای پیش‌فرض
 
-| سرویس | کانفیگ | داده |
-| --- | --- | --- |
+| سرویس      | کانفیگ            | داده                  |
+| ---------- | ----------------- | --------------------- |
 | PasarGuard | `/opt/pasarguard` | `/var/lib/pasarguard` |
-| PG-Node | `/opt/pg-node` | `/var/lib/pg-node` |
+| PG-Node    | `/opt/pg-node`    | `/var/lib/pg-node`    |
 
 ---
 
@@ -263,23 +263,23 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 
 # 🔐 امنیت (Security)
 
-| حوزه | مشکل قبلی | راه‌حل |
-| --- | --- | --- |
-| Manual Restore | نام فایل ZIP بدون escape (Command Injection) | اعتبارسنجی سخت‌گیرانه‌ی نام فایل |
-| استخراج آرشیو | `unzip -o` به Zip-Slip اجازه می‌داد | استخراج با `zipfile` + بررسی مسیر هر entry |
-| ریستور SQLite | مسیر مقصد از بکاپ خوانده می‌شد (overwrite دلخواه) | `realpath` محدود به `/var/lib/pasarguard/` |
-| manifest.tsv | نام فایل SQL بدون بررسی traversal | رد هر مقدار شامل `..`, `/`, `\` |
-| توکن/چت‌آیدی تلگرام | plaintext در CLI/unit فایل (world-readable) | فایل `0600` جدا؛ خواندن فقط با `--instance` |
-| رمز MySQL/MariaDB | `MYSQL_PWD` به کانتینر forward نمی‌شد | `docker compose exec -e MYSQL_PWD=...` |
-| دایرکتوری موقت بکاپ | `/tmp` جهانی‌خواندنی | `tempfile.mkdtemp()` با `0700` |
-| آرشیو نهایی | chmod بعد از ساخت (race) | `umask 0077` + chmod 600 بلافاصله |
-| آپدیت خودکار | `curl \| sudo bash` خام | دانلود → SHA256 → اجرا |
-| نام Instance/سرویس | بدون validation در `shell=True` | regex سخت‌گیرانه + `shlex.quote()` |
-| MySQL data-dir مقصد | بین دو مهاجرت رمز عوض نمی‌شد → `1045` | تشخیص و پاک‌سازی bind mount/volume پیش از init |
-| مهاجرت با manifest ناقص | کشف خطا فقط بعد از پاک‌شدن سرور مقصد | بررسی محلی آرشیو پیش از هر عملیات مخرب |
-| بکاپ Postgres/TimescaleDB بدون رمز | فقط `backend["user"]` بدون پاس‌ورد؛ روی نصب password-enforced fail می‌شد | `PGPASSWORD` resolve‌شده از `.env`/`docker-compose.yml` به `pg_dump`/`pg_dumpall` پاس داده می‌شود (v4.2.8) |
-| enumeration دیتابیس با کاربر/سرویس سفارشی | کاربر `pasarguard` و نام سرویس‌های حدسی هاردکد بودند | کاربر/رمز واقعی resolve‌شده + اولویت به نام سرویس تشخیص‌داده‌شده (v4.2.5 – v4.2.8) |
-| مسیر manifest در ریستور محلی | مسیر نسبی `"db_dump"` وابسته به دایرکتوری اجرای اسکریپت بود | مسیر مطلق `PASARGUARD_DIR/db_dump` برای هر ۵ بک‌اند (v4.2.9) |
+| حوزه                                      | مشکل قبلی                                                                | راه‌حل                                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| Manual Restore                            | نام فایل ZIP بدون escape (Command Injection)                             | اعتبارسنجی سخت‌گیرانه‌ی نام فایل                                                                           |
+| استخراج آرشیو                             | `unzip -o` به Zip-Slip اجازه می‌داد                                      | استخراج با `zipfile` + بررسی مسیر هر entry                                                                 |
+| ریستور SQLite                             | مسیر مقصد از بکاپ خوانده می‌شد (overwrite دلخواه)                        | `realpath` محدود به `/var/lib/pasarguard/`                                                                 |
+| manifest.tsv                              | نام فایل SQL بدون بررسی traversal                                        | رد هر مقدار شامل `..`, `/`, `\`                                                                            |
+| توکن/چت‌آیدی تلگرام                       | plaintext در CLI/unit فایل (world-readable)                              | فایل `0600` جدا؛ خواندن فقط با `--instance`                                                                |
+| رمز MySQL/MariaDB                         | `MYSQL_PWD` به کانتینر forward نمی‌شد                                    | `docker compose exec -e MYSQL_PWD=...`                                                                     |
+| دایرکتوری موقت بکاپ                       | `/tmp` جهانی‌خواندنی                                                     | `tempfile.mkdtemp()` با `0700`                                                                             |
+| آرشیو نهایی                               | chmod بعد از ساخت (race)                                                 | `umask 0077` + chmod 600 بلافاصله                                                                          |
+| آپدیت خودکار                              | `curl \| sudo bash` خام                                                  | دانلود → SHA256 → اجرا                                                                                     |
+| نام Instance/سرویس                        | بدون validation در `shell=True`                                          | regex سخت‌گیرانه + `shlex.quote()`                                                                         |
+| MySQL data-dir مقصد                       | بین دو مهاجرت رمز عوض نمی‌شد → `1045`                                    | تشخیص و پاک‌سازی bind mount/volume پیش از init                                                             |
+| مهاجرت با manifest ناقص                   | کشف خطا فقط بعد از پاک‌شدن سرور مقصد                                     | بررسی محلی آرشیو پیش از هر عملیات مخرب                                                                     |
+| بکاپ Postgres/TimescaleDB بدون رمز        | فقط `backend["user"]` بدون پاس‌ورد؛ روی نصب password-enforced fail می‌شد | `PGPASSWORD` resolve‌شده از `.env`/`docker-compose.yml` به `pg_dump`/`pg_dumpall` پاس داده می‌شود (v4.2.8) |
+| enumeration دیتابیس با کاربر/سرویس سفارشی | کاربر `pasarguard` و نام سرویس‌های حدسی هاردکد بودند                     | کاربر/رمز واقعی resolve‌شده + اولویت به نام سرویس تشخیص‌داده‌شده (v4.2.5 – v4.2.8)                         |
+| مسیر manifest در ریستور محلی              | مسیر نسبی `"db_dump"` وابسته به دایرکتوری اجرای اسکریپت بود              | مسیر مطلق `PASARGUARD_DIR/db_dump` برای هر ۵ بک‌اند (v4.2.9)                                               |
 
 > ⚠️ **نکته‌ی باز**: اتصال SSH از `AutoAddPolicy` استفاده می‌کند (پذیرش خودکار کلید میزبان، با هشدار صریح) — ریسک تئوریک MITM روی شبکه‌های نامطمئن. توصیه: فقط از شبکه‌های قابل‌اعتماد اجرا کنید یا کلید میزبان را از قبل دستی verify کنید.
 
@@ -306,7 +306,7 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 * 👨‍💻 Telegram: https://t.me/CIAUB
 * 🐙 GitHub: https://github.com/CIAUB
 
-* ---
+---
 
 # 📜 لایسنس
 
@@ -314,18 +314,22 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 (CC BY-NC-ND 4.0)** منتشر شده است.
 
 ## ✅ چه کاری مجاز است؟
-- استفاده‌ی شخصی یا داخلی از این نرم‌افزار، **کاملاً رایگان**.
+
+* استفاده‌ی شخصی یا داخلی از این نرم‌افزار، **کاملاً رایگان**.
 
 ## ❌ چه کاری ممنوع است؟
-| ممنوعیت | توضیح |
-| --- | --- |
-| 🚫 فروش | فروش نرم‌افزار یا میزبانی آن به‌عنوان سرویس پولی ممنوع است. |
-| 🚫 کپی / فورک | آپلود کپی یا نسخه‌ی این پروژه در GitHub، GitLab یا هر پلتفرم دیگر ممنوع است. |
-| 🚫 تغییر و بازنشر | ساخت و انتشار نسخه‌ی تغییریافته (Derivative Work) ممنوع است. |
-| 🚫 ادعای مالکیت | حذف یا جایگزینی نام توسعه‌دهنده‌ی اصلی (CIAUB) در فایل LICENSE ممنوع است. |
+
+| ممنوعیت           | توضیح                                                                        |
+| ----------------- | ---------------------------------------------------------------------------- |
+| 🚫 فروش           | فروش نرم‌افزار یا میزبانی آن به‌عنوان سرویس پولی ممنوع است.                  |
+| 🚫 کپی / فورک     | آپلود کپی یا نسخه‌ی این پروژه در GitHub، GitLab یا هر پلتفرم دیگر ممنوع است. |
+| 🚫 تغییر و بازنشر | ساخت و انتشار نسخه‌ی تغییریافته (Derivative Work) ممنوع است.                 |
+| 🚫 ادعای مالکیت   | حذف یا جایگزینی نام توسعه‌دهنده‌ی اصلی (CIAUB) در فایل LICENSE ممنوع است.    |
 
 ## ⚖️ ضمانت اجرا
+
 نقض هر یک از شرایط بالا، به‌صورت خودکار حق استفاده از این نرم‌افزار را باطل می‌کند.
+
 موارد نقض ممکن است از طریق فرآیند **DMCA Takedown** به پلتفرم میزبان (مثل GitHub)
 گزارش شده و طبق قوانین کپی‌رایت پیگیری قانونی شوند.
 
@@ -336,13 +340,12 @@ Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
 
 ---
 
-
 ### ❤️ حمایت از پروژه
 
 اگر این پروژه برای شما مفید بوده است، با ثبت ⭐ در GitHub یا با دونیت کریپتویی از بالای صفحه از توسعه آن حمایت کنید.
 
 ---
 
-<sub><sub>Developed by CIAUB</sub></sub>
+<sub>Developed by CIAUB</sub>
 
 </div>
