@@ -2,6 +2,23 @@
 
 <div dir="rtl">
 
+## v5.0.0 — security hardening pass (pre-release review)
+- install.sh rewritten: release-tag source, SHA-256 verification (`pg_backup.py.sha256`, optional `--sha256`), private temp dir, atomic install, syntax check, no cache-buster/predictable /tmp path.
+- In-app updater no longer offers to run an unverified installer.
+- Panel: migration path allowlist (state/credentials dirs blocked, real SQLite only), JSON body cap, session revocation on logout, encrypted TOTP secret, constant-time username compare, security headers + no-store, Telegram/proxy validation.
+- Fewer errors: unknown NOT NULL columns from a different panel version are filled with neutral defaults (reported as warnings; only un-guessable types still block); wrong/stale DB credentials fall back to those in the panel's .env / the DB container environment / passwordless local socket.
+- DB passwords are passed to docker via environment, not argv. Optional SSH host-key pinning. Caddy/systemd hardening, email/domain validation.
+
+## v5.0.0 — پنل تحت وب + مهاجرت بین پنل‌ها
+
+* **پنل تحت وب (اختیاری، منوی 7):** سرویس جدا (Starlette + uvicorn) با رابط فارسی RTL، پشت Caddy با HTTPS خودکار (Let's Encrypt برای دامنه، یا گواهی داخلی برای IP) و مسیر مخفی تصادفی. ورود با رمز scrypt، TOTP + کد بازیابی، قفل موقت پس از تلاش ناموفق، نشست امضاشده و محافظت CSRF. محدودیت IP عمداً وجود ندارد. مدیریت بکاپ‌ها، زمان‌بندها (با لاگ زنده)، تنظیمات تلگرام (+ تست ارسال)، چندسرور و انتقال، و لاگ زنده‌ی کارها.
+* **موتور مهاجرت (منوی 8 و `--cli migrate`):** Marzban / Marzneshin / Rebecca / 3x-ui ← PasarGuard و PasarGuard ⇄ Marzban، با dry-run، بررسی ساختار جدول مقصد، سیاست تداخل نام، نگاشت ادمین/گروه، تراکنش واحد، بکاپ خودکار مقصد قبل از نوشتن و ری‌استارت پنل مقصد. پشتیبانی از SQLite (تست‌شده) و PostgreSQL/TimescaleDB/MySQL/MariaDB داخل Docker (آزمایشی — هنوز روی نصب واقعی تست نشده).
+* **CLI بدون پرسش:** `--cli backup | restore | transfer | telegram-send | migrate`؛ اعتبارنامه‌ها فقط از متغیر محیطی/فایل 0600، نه آرگومان خط فرمان.
+* بازآرایی: منطق انتقال و ریستور به توابع قابل‌استفاده‌ی مجدد (`_transfer_to_server`، `_restore_from_zip`) تقسیم شد؛ انتقال با **کلید SSH** هم پشتیبانی می‌شود.
+* اجزای اضافی (پکیج `pgb`) هنگام نیاز دانلود می‌شوند و فایل‌به‌فایل با `pgb-manifest.json` — که SHA-256 آن داخل همین اسکریپت جاسازی شده — راستی‌آزمایی می‌شوند. `install.sh` تغییری نکرده است.
+* منوی اصلی: گزینه‌ی خروج از 7 به **9** منتقل شد.
+* **رابط چندزبانه** (English پیش‌فرض / Русский / فارسی با RTL)، **تم سیستم‌محور** (تیره/روشن + انتخاب دستی) و فونت‌های بسته‌بندی‌شده‌ی Inter و Vazirmatn (OFL).
+
 ## v4.2.9 — رفع مسیر نسبی db_dump در Manual Restore محلی
 
 * `workflow_manual_restore` هنگام ریستور دیتابیس، مسیر نسبی `"db_dump"` را به `_restore_databases_local` پاس می‌داد (هم برای SQLite و هم برای Postgres/TimescaleDB/MySQL/MariaDB). این مسیر توسط `_read_manifest`/`_diagnose_missing_manifest` مستقیماً با `os.path` باز می‌شد، پس نسبت به **دایرکتوری فعلی اجرای اسکریپت** resolve می‌شد، نه `/opt/pasarguard`. نتیجه: هر اجرای Manual Restore از مسیری غیر از خودِ `/opt/pasarguard` (رایج‌ترین حالت، چون فایل ZIP معمولاً جای دیگری است) با خطای کاذب «manifest.tsv not found or empty — db_dump does not exist locally» متوقف می‌شد، حتی وقتی استخراج آرشیو کاملاً موفق بود و `/opt/pasarguard/db_dump` پر از داده‌ی درست بود.

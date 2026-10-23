@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 # ============================================================
-#   Pasarguard Backup Utility  v4.2.9
+#   Pasarguard Backup Utility  v5.0.0
 #   Dev by: CIA 
 #   GitHub: https://github.com/CIAUB
+#   v5.0.0 — Web panel + panel-to-panel migration (CC BY-NC-ND):
+#          * NEW optional web panel (menu 7): HTTPS via Caddy, random secret
+#            URL path, scrypt password + TOTP 2FA + rate limiting, backup
+#            manager, scheduler manager with live logs, Telegram settings,
+#            multi-server transfer, live job logs. Installed on demand; the
+#            frozen install.sh is untouched.
+#          * NEW migration engine (menu 8 / --cli migrate): Marzban,
+#            Marzneshin, Rebecca, 3x-ui/x-ui -> PasarGuard and
+#            PasarGuard <-> Marzban, with dry-run, schema checks, conflict
+#            policies and an automatic target backup before any write.
+#          * NEW headless `--cli backup|restore|transfer|telegram-send|migrate`.
+#          * Transfer/restore logic split into reusable functions
+#            (_transfer_to_server, _restore_from_zip); SSH key auth support.
+#          * Components are verified against pgb-manifest.json whose SHA-256
+#            is embedded in this script.
 #   v4.2.9 — Manual Restore db_dump path fix:
 #          * workflow_manual_restore's local database-restore calls passed
 #            the relative path "db_dump" into _restore_databases_local, so
@@ -499,7 +514,7 @@ def print_header(title=""):
     print()
     for line in LOGO:
         print(center(C.R1 + C.BOLD + line + C.RESET, LOGO_W))
-    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 4 . 2 . 9   -   C I A U B" + C.RESET
+    sub = C.R1 + C.BOLD + "B A C K U P   U T I L I T Y   v 5 . 0 . 0   -   C I A U B" + C.RESET
     print(center(sub, 57))
     print()
     print(hline())
@@ -3132,6 +3147,205 @@ def _restore_sqlite_local(db_dir, entries):
         run_command("cd /opt/pasarguard && docker compose start pasarguard", quiet=True)
     return True
 
+def _ssh_connect(ssh, host, port, user, password=None, key_text=None):
+    """Connect with a password or an in-memory private key (never written to disk)."""
+    if key_text:
+        import io
+        pkey, last = None, None
+        for cls in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+            try:
+                pkey = cls.from_private_key(io.StringIO(key_text), password=password or None)
+                break
+            except Exception as e:
+                last = e
+        if pkey is None:
+            raise ValueError(f"unsupported or encrypted SSH private key: {last}")
+        ssh.connect(hostname=host, port=port, username=user, pkey=pkey, timeout=15,
+                    allow_agent=False, look_for_keys=False)
+    else:
+        ssh.connect(hostname=host, port=port, username=user, password=password, timeout=15,
+                    allow_agent=False, look_for_keys=False)
+
+def _host_key_fingerprint(key):
+    """OpenSSH-style 'SHA256:<base64>' fingerprint of a paramiko host key."""
+    import base64, hashlib
+    return "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+
+
+def _pinned_policy(expected):
+    """Host-key policy that only accepts the pinned SHA256 fingerprint."""
+    expected = expected.strip()
+
+    class _Pinned(paramiko.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            got = _host_key_fingerprint(key)
+            if got != expected:
+                raise paramiko.SSHException(
+                    f"host key mismatch for {hostname}: expected {expected}, server presented {got}")
+    return _Pinned()
+
+
+def _transfer_to_server(zip_path, include_node, host, port, user, password=None, key_text=None, host_fp=None):
+    """Push `zip_path` to a new server over SSH and restore it there.
+    Headless (no prompts) — shared by the menu and `--cli transfer`. Returns True on success."""
+    print_info(f"Connecting to {host}...")
+    ssh = paramiko.SSHClient()
+    # NOTE: this still auto-accepts unknown host keys (no TOFU verification
+    # against a known_hosts file), which is inherently weak against a
+    # man-in-the-middle on first connect. We at least surface that clearly
+    # instead of doing it silently — see warning below.
+    if host_fp:
+        ssh.set_missing_host_key_policy(_pinned_policy(host_fp))
+        print_info("SSH host key is pinned; any other key will be rejected.")
+    else:
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        print_warning("SSH host key will be trusted on first connect (no verification). "
+                      "Pass the server's fingerprint (--host-fp / panel field) to prevent a man-in-the-middle.")
+    try:
+        _ssh_connect(ssh, host, port, user, password, key_text)
+        print_success("Connected!")
+        print_info(f"Server host key: {_host_key_fingerprint(ssh.get_transport().get_remote_server_key())}")
+        print()
+
+        execute_ssh_command(ssh,
+            "apt-get update >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1",
+            "Installing unzip")
+
+        if include_node:
+            if not stop_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
+                print_error("Could not stop PG-Node. Aborting.")
+                return False
+        if not stop_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
+            print_error("Could not stop Pasarguard. Aborting.")
+            return False
+
+        if not clean_dirs_ssh(ssh, include_node):
+            print_error("Directory cleanup failed. Aborting.")
+            return False
+
+        print_info("Uploading backup file (depends on internet speed)...")
+        sftp       = ssh.open_sftp()
+        zip_fn     = os.path.basename(zip_path)
+        remote_zip = f"/opt/pasarguard/{zip_fn}"
+        sftp.put(zip_path, remote_zip)
+        sftp.chmod(remote_zip, 0o600)
+        sftp.close()
+        print_success("Upload completed.")
+
+        # v4.2.1 — pre-validate the archive LOCALLY before asking the
+        # remote to extract it. A malicious or tampered backup could carry
+        # entries like `../../etc/cron.d/evil`; refusing up-front (rather
+        # than letting the remote `unzip` write them out as root) keeps
+        # the transfer host safe too. _safe_extract_zip also extracts
+        # safely if we pass `extract=False`, but for the transfer path
+        # we still let the remote do the extraction so any non-/opt/
+        # entries surface there.
+        try:
+            with zipfile.ZipFile(zip_path) as _z:
+                for _member in _z.namelist():
+                    _target = os.path.realpath(os.path.join("/opt/pasarguard", _member))
+                    if not (_target == os.path.realpath("/opt/pasarguard")
+                            or _target.startswith(os.path.realpath("/opt/pasarguard") + os.sep)):
+                        raise ValueError(f"zip-slip entry refused: {_member!r}")
+        except (ValueError, zipfile.BadZipFile) as e:
+            print_error(f"Refusing to extract archive on remote: {e}")
+            return False
+
+        execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {shlex.quote(zip_fn)}",
+                            "Extracting files")
+
+        try:
+            remote_backend = _detect_backend_ssh(ssh)
+        except Exception as e:
+            print_warning(f"Backend detection failed on remote: {e} — assuming legacy postgres")
+            remote_backend = {"type": "postgresql", "container": None, "dbname": "pasarguard",
+                              "user": "pasarguard", "password": "", "env": {}, "services": [],
+                              "host": "127.0.0.1", "port": 5432, "sqlite_path": None}
+        print_info(
+            f"Detected remote backend: {C.BOLD}{remote_backend['type']}{C.RESET}  "
+            f"db={remote_backend['dbname']}  container={remote_backend['container'] or '(none — sqlite)'}"
+        )
+
+        execute_ssh_command(ssh,
+            "cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true "
+            "&& rm -rf /opt/pasarguard/pasarguard_data",
+            "Restoring PasarGuard data")
+
+        if include_node:
+            execute_ssh_command(ssh,
+                "cp -a /opt/pasarguard/pg_node_opt/. /opt/pg-node/ 2>/dev/null || true "
+                "&& rm -rf /opt/pasarguard/pg_node_opt",
+                "Restoring PG-Node config")
+            execute_ssh_command(ssh,
+                "cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true "
+                "&& rm -rf /opt/pasarguard/pg_node_data",
+                "Restoring PG-Node data")
+
+        if remote_backend["type"] == "sqlite":
+            if not _restore_databases_remote(ssh, "db_dump", None, backend_type="sqlite"):
+                print_error("SQLite restore failed. Aborting.")
+                return False
+            if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
+                print_error("Pasarguard did not start. Aborting.")
+                return False
+            if include_node and not start_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
+                print_error("PG-Node did not start.")
+            print_header("Transfer & Restore Completed Successfully!")
+            print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") +
+                          " running on the new server.")
+            return True
+
+        remote_db_svc = remote_backend["container"]
+        if not remote_db_svc:
+            print_error(f"Could not determine the {remote_backend['type']} container for restore.")
+            return False
+
+        # v4.2.3 — wipe MySQL data dir BEFORE starting the container so it
+        # re-inits with the credentials from the new .env. MySQL only reads
+        # MYSQL_ROOT_PASSWORD on first init; stale data on a bind mount
+        # (the typical PasarGuard install) survives `docker compose down -v`
+        # and would silently keep the OLD password, causing 1045 during
+        # restore. This must run after the zip is extracted (so we see the
+        # new docker-compose.yml) and before start_compose_ssh starts MySQL.
+        if remote_backend["type"] in ("mysql", "mariadb"):
+            _wipe_mysql_data_remote(ssh, remote_db_svc)
+
+        # v4.2.2 — pass backend_type so wait_db_* picks the right readiness
+        # probe (pg_isready for postgres/timescaledb, mysqladmin ping for
+        # mysql/mariadb). Previously wait_postgres=True hard-coded pg_isready
+        # which doesn't exist in a mysql image, so the wait always timed out
+        # and the whole transfer aborted with 'mysql did not start'.
+        if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB",
+                                  services=[remote_db_svc], wait_db=True,
+                                  backend_type=remote_backend["type"]):
+            print_error(f"{remote_db_svc} did not start. Aborting.")
+            return False
+
+        if not _restore_databases_remote(ssh, "db_dump", remote_db_svc, backend_type=remote_backend["type"]):
+            print_error("Database restore failed. Aborting.")
+            return False
+
+        if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
+            print_error("Pasarguard did not start. Aborting.")
+            return False
+        if include_node and not start_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
+            print_error("PG-Node did not start.")
+
+        print_header("Transfer & Restore Completed Successfully!")
+        print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") +
+                      " running on the new server.")
+        return True
+
+    except paramiko.AuthenticationException:
+        print_error("SSH authentication failed (wrong password or key).")
+        return False
+    except Exception as e:
+        print_error(f"Connection error: {e}")
+        return False
+    finally:
+        ssh.close()
+    return True
+
 def workflow_transfer():
     print_header("Auto Backup & Transfer to New Server")
 
@@ -3177,154 +3391,9 @@ def workflow_transfer():
     # or left sitting in shell/screen scrollback.
     new_pass = getpass.getpass(f"  {C.R2}> Root Password: {C.RESET}").strip()
 
-    print_info(f"Connecting to {new_ip}...")
-    ssh = paramiko.SSHClient()
-    # NOTE: this still auto-accepts unknown host keys (no TOFU verification
-    # against a known_hosts file), which is inherently weak against a
-    # man-in-the-middle on first connect. We at least surface that clearly
-    # instead of doing it silently — see warning below.
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    print_warning("SSH host key will be trusted on first connect (no verification). "
-                  "Make sure you're on a trusted network.")
     try:
-        ssh.connect(hostname=new_ip, username="root", password=new_pass, timeout=10)
-        print_success("Connected!")
-        print()
-
-        execute_ssh_command(ssh,
-            "apt-get update >/dev/null 2>&1 && apt-get install -y unzip >/dev/null 2>&1",
-            "Installing unzip")
-
-        if include_node:
-            if not stop_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
-                print_error("Could not stop PG-Node. Aborting.")
-                return
-        if not stop_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
-            print_error("Could not stop Pasarguard. Aborting.")
-            return
-
-        if not clean_dirs_ssh(ssh, include_node):
-            print_error("Directory cleanup failed. Aborting.")
-            return
-
-        print_info("Uploading backup file (depends on internet speed)...")
-        sftp       = ssh.open_sftp()
-        zip_fn     = os.path.basename(zip_path)
-        remote_zip = f"/opt/pasarguard/{zip_fn}"
-        sftp.put(zip_path, remote_zip)
-        sftp.chmod(remote_zip, 0o600)
-        sftp.close()
-        print_success("Upload completed.")
-
-        # v4.2.1 — pre-validate the archive LOCALLY before asking the
-        # remote to extract it. A malicious or tampered backup could carry
-        # entries like `../../etc/cron.d/evil`; refusing up-front (rather
-        # than letting the remote `unzip` write them out as root) keeps
-        # the transfer host safe too. _safe_extract_zip also extracts
-        # safely if we pass `extract=False`, but for the transfer path
-        # we still let the remote do the extraction so any non-/opt/
-        # entries surface there.
-        try:
-            with zipfile.ZipFile(zip_path) as _z:
-                for _member in _z.namelist():
-                    _target = os.path.realpath(os.path.join("/opt/pasarguard", _member))
-                    if not (_target == os.path.realpath("/opt/pasarguard")
-                            or _target.startswith(os.path.realpath("/opt/pasarguard") + os.sep)):
-                        raise ValueError(f"zip-slip entry refused: {_member!r}")
-        except (ValueError, zipfile.BadZipFile) as e:
-            print_error(f"Refusing to extract archive on remote: {e}")
-            return
-
-        execute_ssh_command(ssh, f"cd /opt/pasarguard && unzip -q -o {shlex.quote(zip_fn)}",
-                            "Extracting files")
-
-        try:
-            remote_backend = _detect_backend_ssh(ssh)
-        except Exception as e:
-            print_warning(f"Backend detection failed on remote: {e} — assuming legacy postgres")
-            remote_backend = {"type": "postgresql", "container": None, "dbname": "pasarguard",
-                              "user": "pasarguard", "password": "", "env": {}, "services": [],
-                              "host": "127.0.0.1", "port": 5432, "sqlite_path": None}
-        print_info(
-            f"Detected remote backend: {C.BOLD}{remote_backend['type']}{C.RESET}  "
-            f"db={remote_backend['dbname']}  container={remote_backend['container'] or '(none — sqlite)'}"
-        )
-
-        execute_ssh_command(ssh,
-            "cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true "
-            "&& rm -rf /opt/pasarguard/pasarguard_data",
-            "Restoring PasarGuard data")
-
-        if include_node:
-            execute_ssh_command(ssh,
-                "cp -a /opt/pasarguard/pg_node_opt/. /opt/pg-node/ 2>/dev/null || true "
-                "&& rm -rf /opt/pasarguard/pg_node_opt",
-                "Restoring PG-Node config")
-            execute_ssh_command(ssh,
-                "cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true "
-                "&& rm -rf /opt/pasarguard/pg_node_data",
-                "Restoring PG-Node data")
-
-        if remote_backend["type"] == "sqlite":
-            if not _restore_databases_remote(ssh, "db_dump", None, backend_type="sqlite"):
-                print_error("SQLite restore failed. Aborting.")
-                return
-            if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
-                print_error("Pasarguard did not start. Aborting.")
-                return
-            if include_node and not start_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
-                print_error("PG-Node did not start.")
-            print_header("Transfer & Restore Completed Successfully!")
-            print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") +
-                          " running on the new server.")
-            return
-
-        remote_db_svc = remote_backend["container"]
-        if not remote_db_svc:
-            print_error(f"Could not determine the {remote_backend['type']} container for restore.")
-            return
-
-        # v4.2.3 — wipe MySQL data dir BEFORE starting the container so it
-        # re-inits with the credentials from the new .env. MySQL only reads
-        # MYSQL_ROOT_PASSWORD on first init; stale data on a bind mount
-        # (the typical PasarGuard install) survives `docker compose down -v`
-        # and would silently keep the OLD password, causing 1045 during
-        # restore. This must run after the zip is extracted (so we see the
-        # new docker-compose.yml) and before start_compose_ssh starts MySQL.
-        if remote_backend["type"] in ("mysql", "mariadb"):
-            _wipe_mysql_data_remote(ssh, remote_db_svc)
-
-        # v4.2.2 — pass backend_type so wait_db_* picks the right readiness
-        # probe (pg_isready for postgres/timescaledb, mysqladmin ping for
-        # mysql/mariadb). Previously wait_postgres=True hard-coded pg_isready
-        # which doesn't exist in a mysql image, so the wait always timed out
-        # and the whole transfer aborted with 'mysql did not start'.
-        if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard DB",
-                                  services=[remote_db_svc], wait_db=True,
-                                  backend_type=remote_backend["type"]):
-            print_error(f"{remote_db_svc} did not start. Aborting.")
-            return
-
-        if not _restore_databases_remote(ssh, "db_dump", remote_db_svc, backend_type=remote_backend["type"]):
-            print_error("Database restore failed. Aborting.")
-            return
-
-        if not start_compose_ssh(ssh, PASARGUARD_DIR, "Pasarguard"):
-            print_error("Pasarguard did not start. Aborting.")
-            return
-        if include_node and not start_compose_ssh(ssh, PG_NODE_DIR, "PG-Node"):
-            print_error("PG-Node did not start.")
-
-        print_header("Transfer & Restore Completed Successfully!")
-        print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") +
-                      " running on the new server.")
-
-    except paramiko.AuthenticationException:
-        print_error("Incorrect server password!")
-    except Exception as e:
-        print_error(f"Connection error: {e}")
+        _transfer_to_server(zip_path, include_node, new_ip, 22, "root", new_pass)
     finally:
-        ssh.close()
         try:
             if os.path.exists(zip_path):
                 os.remove(zip_path)
@@ -3443,6 +3512,113 @@ def _is_safe_filename(name):
         _SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
     return bool(name) and "/" not in name and ".." not in name and bool(_SAFE_FILENAME_RE.match(name))
 
+def _zip_has_node(zip_name):
+    try:
+        with zipfile.ZipFile(zip_name) as z:
+            return any(n.startswith(("pg_node_opt/", "pg_node_data/")) for n in z.namelist())
+    except Exception:
+        return False
+
+def _restore_from_zip(zip_name, include_node):
+    """Headless restore of a local backup zip over /opt/pasarguard. Returns True on success.
+    Shared by the menu (workflow_manual_restore) and `--cli restore`."""
+    try:
+        if include_node and not stop_compose_local(PG_NODE_DIR, "PG-Node"):
+            print_error("Could not stop PG-Node. Aborting.")
+            return False
+        if not stop_compose_local(PASARGUARD_DIR, "Pasarguard"):
+            print_error("Could not stop Pasarguard. Aborting.")
+            return False
+
+        if not clean_dirs_local(include_node):
+            print_error("Directory cleanup failed. Aborting.")
+            return False
+
+        print_info("Extracting backup archive...")
+        # v4.2.1 — extract via Python's zipfile module after validating
+        # every member against path-traversal (Zip Slip). A malicious
+        # archive could carry entries like `../../etc/cron.d/evil` that
+        # `unzip -o` would write straight to that path as root.
+        try:
+            _safe_extract_zip(zip_name, "/opt/pasarguard")
+        except (ValueError, zipfile.BadZipFile) as e:
+            print_error(f"Refusing to extract archive: {e}")
+            return False
+        except Exception as e:
+            print_error(f"Extraction failed: {e}")
+            return False
+
+        print_info("Restoring PasarGuard data...")
+        run_command("cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true")
+        run_command("rm -rf /opt/pasarguard/pasarguard_data")
+
+        if include_node:
+            print_info("Restoring PG-Node config and data...")
+            run_command("cp -a /opt/pasarguard/pg_node_opt/. /opt/pg-node/ 2>/dev/null || true")
+            run_command("cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true")
+            run_command("rm -rf /opt/pasarguard/pg_node_opt /opt/pasarguard/pg_node_data")
+
+        try:
+            backend = _detect_backend_local()
+        except Exception as e:
+            print_warning(f"Backend detection failed: {e} — assuming legacy postgres")
+            backend = {"type": "postgresql", "container": None, "dbname": "pasarguard",
+                       "user": "pasarguard", "password": "", "env": {}, "services": [],
+                       "host": "127.0.0.1", "port": 5432, "sqlite_path": None}
+        print_info(
+            f"Detected backend: {C.BOLD}{backend['type']}{C.RESET}  "
+            f"db={backend['dbname']}  container={backend['container'] or '(none — sqlite)'}"
+        )
+
+        if backend["type"] == "sqlite":
+            if not _restore_databases_local(os.path.join(PASARGUARD_DIR, "db_dump"), None, backend_type="sqlite"):
+                raise Exception("SQLite restore failed.")
+            if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
+                raise Exception("Pasarguard did not start")
+            if include_node and not start_compose_local(PG_NODE_DIR, "PG-Node"):
+                print_error("PG-Node did not start.")
+            print_header("Local Restore Completed Successfully!")
+            print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running.")
+            return True
+
+        local_db_svc = backend["container"]
+        if not local_db_svc:
+            raise Exception(f"Could not determine the {backend['type']} container for restore.")
+        print_info(f"Detected database service: {local_db_svc}")
+
+        # v4.2.3 — same MySQL data-dir wipe as workflow_transfer (see
+        # _wipe_mysql_data_remote for the full rationale). MySQL only
+        # honours MYSQL_ROOT_PASSWORD on first init, so a stale data dir
+        # on a bind mount would keep the old password and 1045 the restore.
+        if backend["type"] in ("mysql", "mariadb"):
+            _wipe_mysql_data_local(local_db_svc)
+
+        # v4.2.2 — same backend-aware wait fix as workflow_transfer (see
+        # comment there). wait_db_local dispatches by backend_type instead
+        # of unconditionally running pg_isready.
+        if not start_compose_local(PASARGUARD_DIR, "Pasarguard DB",
+                                    services=[local_db_svc], wait_db=True,
+                                    backend_type=backend["type"]):
+            raise Exception(f"{local_db_svc} did not start")
+
+        if not _restore_databases_local(os.path.join(PASARGUARD_DIR, "db_dump"), local_db_svc, backend_type=backend["type"]):
+            raise Exception("Database restore failed.")
+
+        if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
+            raise Exception("Pasarguard did not start")
+        if include_node and not start_compose_local(PG_NODE_DIR, "PG-Node"):
+            print_error("PG-Node did not start.")
+
+        print_header("Local Restore Completed Successfully!")
+        print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running.")
+        return True
+
+    except Exception as e:
+        print_error(f"Restore error: {e}")
+        print_warning("System may be in a partially restored state.")
+        return False
+
+
 def workflow_manual_restore():
     print_header("Manual Restore (Local)")
 
@@ -3484,99 +3660,7 @@ def workflow_manual_restore():
         print_warning("Aborted.")
         return
 
-    try:
-        if include_node and not stop_compose_local(PG_NODE_DIR, "PG-Node"):
-            print_error("Could not stop PG-Node. Aborting.")
-            return
-        if not stop_compose_local(PASARGUARD_DIR, "Pasarguard"):
-            print_error("Could not stop Pasarguard. Aborting.")
-            return
-
-        if not clean_dirs_local(include_node):
-            print_error("Directory cleanup failed. Aborting.")
-            return
-
-        print_info("Extracting backup archive...")
-        # v4.2.1 — extract via Python's zipfile module after validating
-        # every member against path-traversal (Zip Slip). A malicious
-        # archive could carry entries like `../../etc/cron.d/evil` that
-        # `unzip -o` would write straight to that path as root.
-        try:
-            _safe_extract_zip(zip_name, "/opt/pasarguard")
-        except (ValueError, zipfile.BadZipFile) as e:
-            print_error(f"Refusing to extract archive: {e}")
-            return
-        except Exception as e:
-            print_error(f"Extraction failed: {e}")
-            return
-
-        print_info("Restoring PasarGuard data...")
-        run_command("cp -a /opt/pasarguard/pasarguard_data/. /var/lib/pasarguard/ 2>/dev/null || true")
-        run_command("rm -rf /opt/pasarguard/pasarguard_data")
-
-        if include_node:
-            print_info("Restoring PG-Node config and data...")
-            run_command("cp -a /opt/pasarguard/pg_node_opt/. /opt/pg-node/ 2>/dev/null || true")
-            run_command("cp -a /opt/pasarguard/pg_node_data/. /var/lib/pg-node/ 2>/dev/null || true")
-            run_command("rm -rf /opt/pasarguard/pg_node_opt /opt/pasarguard/pg_node_data")
-
-        try:
-            backend = _detect_backend_local()
-        except Exception as e:
-            print_warning(f"Backend detection failed: {e} — assuming legacy postgres")
-            backend = {"type": "postgresql", "container": None, "dbname": "pasarguard",
-                       "user": "pasarguard", "password": "", "env": {}, "services": [],
-                       "host": "127.0.0.1", "port": 5432, "sqlite_path": None}
-        print_info(
-            f"Detected backend: {C.BOLD}{backend['type']}{C.RESET}  "
-            f"db={backend['dbname']}  container={backend['container'] or '(none — sqlite)'}"
-        )
-
-        if backend["type"] == "sqlite":
-            if not _restore_databases_local(os.path.join(PASARGUARD_DIR, "db_dump"), None, backend_type="sqlite"):
-                raise Exception("SQLite restore failed.")
-            if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
-                raise Exception("Pasarguard did not start")
-            if include_node and not start_compose_local(PG_NODE_DIR, "PG-Node"):
-                print_error("PG-Node did not start.")
-            print_header("Local Restore Completed Successfully!")
-            print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running.")
-            return
-
-        local_db_svc = backend["container"]
-        if not local_db_svc:
-            raise Exception(f"Could not determine the {backend['type']} container for restore.")
-        print_info(f"Detected database service: {local_db_svc}")
-
-        # v4.2.3 — same MySQL data-dir wipe as workflow_transfer (see
-        # _wipe_mysql_data_remote for the full rationale). MySQL only
-        # honours MYSQL_ROOT_PASSWORD on first init, so a stale data dir
-        # on a bind mount would keep the old password and 1045 the restore.
-        if backend["type"] in ("mysql", "mariadb"):
-            _wipe_mysql_data_local(local_db_svc)
-
-        # v4.2.2 — same backend-aware wait fix as workflow_transfer (see
-        # comment there). wait_db_local dispatches by backend_type instead
-        # of unconditionally running pg_isready.
-        if not start_compose_local(PASARGUARD_DIR, "Pasarguard DB",
-                                    services=[local_db_svc], wait_db=True,
-                                    backend_type=backend["type"]):
-            raise Exception(f"{local_db_svc} did not start")
-
-        if not _restore_databases_local(os.path.join(PASARGUARD_DIR, "db_dump"), local_db_svc, backend_type=backend["type"]):
-            raise Exception("Database restore failed.")
-
-        if not start_compose_local(PASARGUARD_DIR, "Pasarguard"):
-            raise Exception("Pasarguard did not start")
-        if include_node and not start_compose_local(PG_NODE_DIR, "PG-Node"):
-            print_error("PG-Node did not start.")
-
-        print_header("Local Restore Completed Successfully!")
-        print_success("PasarGuard" + (" and PG-Node are" if include_node else " is") + " running.")
-
-    except Exception as e:
-        print_error(f"Restore error: {e}")
-        print_warning("System may be in a partially restored state.")
+    return _restore_from_zip(zip_name, include_node)
 
 # ── Workflow 5: Manage running/installed schedulers ───────────
 def _systemctl_action(unit_name, action, quiet=False):
@@ -3915,22 +3999,14 @@ def workflow_update():
                     return
                 print_success(f"SHA256 verified: {actual}")
             except Exception as e:
-                print_warning(f"Could not parse hash file ({e}) — proceeding anyway.")
-        else:
-            # v4.2.1 — refuse to silently downgrade. An attacker who can
-            # MITM the hash file (or block its download) but not the
-            # script itself would otherwise get a free sudo bash. Require
-            # the user to opt in explicitly.
-            print_warning("Could not download install.sh.sha256 — no integrity check available.")
-            print_warning("(Network problem, or the publisher hasn't published a hash file on this branch.)")
-            yn = input(
-                f"  {C.R1}> Run the unverified installer as root anyway? (y/n): {C.RESET}"
-            ).strip().lower()
-            if yn != "y":
-                print_error("Aborted for safety. The hash file is the only defense against a")
-                print_error("tampered installer — without it, running the script is unsafe.")
+                print_error(f"Could not parse the hash file ({e}) — refusing to run the installer.")
                 return
-            print_warning("Proceeding WITHOUT integrity verification at the user's explicit request.")
+        else:
+            # v5.0.0 — no "run it unverified anyway" escape hatch any more: a
+            # root shell is too much to hand to an unverifiable download.
+            print_error("Could not download install.sh.sha256 — refusing to run an unverified installer as root.")
+            print_info("Check your network, or download install.sh yourself and run: sudo bash install.sh --sha256 <hash>")
+            return
 
         print()
         print(hline())
@@ -4001,6 +4077,197 @@ def run_daemon_from_args():
     proxy = args.proxy or proxy  # args.proxy is always None (SUPPRESS) — kept for back-compat
     run_scheduled_backup_loop(token, chat, args.interval, args.node, proxy, args.instance)
 
+# ══════════════════════════════════════════════════════════════
+#  v5.0.0 — optional components (web panel + panel migration)
+# ══════════════════════════════════════════════════════════════
+# install.sh stays frozen and installs only this single file. The optional
+# `pgb` package (web panel, migration engine) is downloaded on demand and
+# verified file-by-file against pgb-manifest.json, whose own SHA-256 is
+# embedded below — so the components are bound to THIS script, which the
+# user already trusts (tools/build_manifest.py rewrites the constant at
+# release time).
+COMPONENT_DIR      = os.environ.get("PGB_ROOT", "/opt/pg-backup")
+# Components are fetched from the immutable release tag matching this script
+# (vX.Y.Z), not from the moving `main` branch. Publish a tag for every release.
+# PGB_RAW_BASE overrides (tests, mirrors, a fork's main branch).
+COMPONENT_RAW_BASE = os.environ.get("PGB_RAW_BASE", "https://raw.githubusercontent.com/CIAUB/PG-Backup/v5.0.0")
+PGB_MANIFEST_SHA256 = "ed1e66c10bf1a0409121592b16672597baab797e736542fbdf2226744858d765"
+PGB_VERSION = "5.0.0"
+
+def _fetch_bytes(url, timeout=40):
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as r:
+        return r.read()
+
+def _ensure_components(force=False):
+    """Download/verify the pgb package into COMPONENT_DIR. Returns True when ready."""
+    manifest_local = os.path.join(COMPONENT_DIR, "pgb-manifest.json")
+    placeholder = set(PGB_MANIFEST_SHA256) == {"0"}
+    if placeholder and os.environ.get("PGB_ALLOW_UNVERIFIED") != "1":
+        print_error("This build carries no component manifest hash (development copy). "
+                    "Install the released PG-Backup, or set PGB_ALLOW_UNVERIFIED=1 to proceed anyway.")
+        return False
+    try:
+        if not force and os.path.exists(manifest_local):
+            with open(manifest_local, "rb") as f:
+                local = f.read()
+            if hashlib.sha256(local).hexdigest() == PGB_MANIFEST_SHA256 or placeholder:
+                m = json.loads(local)
+                if all(os.path.isfile(os.path.join(COMPONENT_DIR, p))
+                       and _sha256_of(os.path.join(COMPONENT_DIR, p)) == d
+                       for p, d in m["files"].items()):
+                    return True
+        print_info("Downloading PG-Backup components…")
+        raw = _fetch_bytes(f"{COMPONENT_RAW_BASE}/pgb-manifest.json")
+        got = hashlib.sha256(raw).hexdigest()
+        if not placeholder and got != PGB_MANIFEST_SHA256:
+            print_error("Component manifest does not match the hash embedded in this script — refusing to install.")
+            print_error(f"  expected {PGB_MANIFEST_SHA256}\n  got      {got}")
+            print_warning("Update PG-Backup (menu option 6) so the script and the components are the same release.")
+            return False
+        manifest = json.loads(raw)
+        files = manifest["files"]
+        staged = {}
+        for rel, digest in files.items():
+            norm = os.path.normpath(rel)
+            if norm.startswith(("/", "..")) or not norm.startswith("pgb" + os.sep) or ".." in norm.split(os.sep):
+                print_error(f"manifest contains an unsafe path: {rel!r}")
+                return False
+            data = _fetch_bytes(f"{COMPONENT_RAW_BASE}/{rel}")
+            if hashlib.sha256(data).hexdigest() != digest:
+                print_error(f"checksum mismatch for {rel} — refusing to install.")
+                return False
+            staged[norm] = data
+        for norm, data in staged.items():
+            dest = os.path.join(COMPONENT_DIR, norm)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + ".new"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, dest)
+        keep = set(staged)
+        pkg = os.path.join(COMPONENT_DIR, "pgb")
+        for dp, _dn, fns in os.walk(pkg):
+            for fn in fns:
+                rel = os.path.relpath(os.path.join(dp, fn), COMPONENT_DIR)
+                if rel not in keep and "__pycache__" not in rel and not rel.endswith(".pyc"):
+                    try:
+                        os.remove(os.path.join(dp, fn))
+                    except OSError:
+                        pass
+        fd = os.open(manifest_local, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        print_success(f"Components installed in {COMPONENT_DIR} ({len(staged)} files)")
+        return True
+    except Exception as e:
+        print_error(f"Could not install components: {e}")
+        return False
+
+def _component_python(*args):
+    env = dict(os.environ, PYTHONPATH=COMPONENT_DIR, PGB_ROOT=COMPONENT_DIR)
+    return subprocess.run([sys.executable, *args], cwd=COMPONENT_DIR, env=env).returncode
+
+def workflow_web_panel():
+    print_header("Web Panel")
+    if os.geteuid() != 0:
+        print_error("Run PG-Backup as root to manage the web panel.")
+        return
+    if not _ensure_components():
+        return
+    items = [("1", "Install / Update panel", "install"), ("2", "Status & address", "status"),
+             ("3", "Start", "start"), ("4", "Stop", "stop"), ("5", "Restart", "restart"),
+             ("6", "Reset admin password", "reset-password"), ("7", "Disable two-factor (lost device)", "reset-2fa"),
+             ("8", "Show panel address", "url"), ("9", "Uninstall panel", "uninstall"), ("0", "Back", None)]
+    for n, label, _ in items:
+        print(f"  {C.R1}{n}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}{label}{C.RESET}")
+    choice = input(f"\n  {C.R2}> Select: {C.RESET}").strip()
+    cmd = next((c for n, _, c in items if n == choice), None)
+    if cmd:
+        _component_python("-m", "pgb.installer", cmd)
+
+def workflow_migrate():
+    print_header("Panel Migration")
+    print_info("Convert users between PasarGuard / Marzban / Marzneshin / Rebecca / 3x-ui databases.")
+    print_warning("The target database is backed up automatically before anything is written.")
+    if not _ensure_components():
+        return
+    _component_python("-m", "pgb.migrate.cli")
+
+# ── Headless CLI (used by the web panel; also handy for cron/automation) ──
+def _cli_fail(msg, code=1):
+    sys.stderr.write(f"[pg-backup] {msg}\n")
+    sys.exit(code)
+
+def run_cli(argv):
+    p = argparse.ArgumentParser(prog="PG-Backup --cli", add_help=True)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("backup");   b.add_argument("--node", action="store_true")
+    r = sub.add_parser("restore");  r.add_argument("--file", required=True); r.add_argument("--yes", action="store_true")
+    t = sub.add_parser("transfer")
+    t.add_argument("--host", required=True); t.add_argument("--port", type=int, default=22)
+    t.add_argument("--user", default="root"); t.add_argument("--node", action="store_true"); t.add_argument("--yes", action="store_true")
+    g = sub.add_parser("telegram-send"); g.add_argument("--file", required=True); g.add_argument("--instance", default="default")
+    sub.add_parser("version")
+    m = sub.add_parser("migrate"); m.add_argument("rest", nargs=argparse.REMAINDER)
+    a = p.parse_args(argv)
+
+    if a.cmd == "version":
+        print(PGB_VERSION); return 0
+    if a.cmd == "backup":
+        z = create_backup(a.node)
+        if not z:
+            _cli_fail("backup failed")
+        print("RESULT " + json.dumps({"zip": os.path.abspath(z)})); return 0
+    if a.cmd == "restore":
+        if not a.yes:
+            _cli_fail("restore needs --yes (it overwrites the current install)")
+        name = _join_chunks_if_needed(a.file) if os.path.basename(a.file) == a.file else a.file
+        if not name or not os.path.isfile(name):
+            _cli_fail(f"file not found: {a.file}")
+        if not _verify_zip_has_manifest(name):
+            _cli_fail("refusing to restore a backup with no usable database manifest; nothing was touched")
+        return 0 if _restore_from_zip(name, _zip_has_node(name)) else 1
+    if a.cmd == "transfer":
+        if not a.yes:
+            _cli_fail("transfer needs --yes (it replaces PasarGuard on the destination)")
+        if a.user != "root":
+            _cli_fail("the destination user must be root")
+        secret, auth = os.environ.get("PGB_SSH_SECRET", ""), os.environ.get("PGB_SSH_AUTH", "password")
+        if not secret:
+            _cli_fail("no SSH credential supplied (PGB_SSH_SECRET)")
+        z = create_backup(a.node)
+        if not z or not _verify_zip_has_manifest(z):
+            _cli_fail("local backup failed or has no usable manifest; destination was not touched")
+        try:
+            ok_ = _transfer_to_server(z, a.node, a.host, a.port, a.user,
+                                      password=None if auth == "key" else secret,
+                                      key_text=secret if auth == "key" else None,
+                                      host_fp=os.environ.get("PGB_SSH_HOSTKEY") or None)
+        finally:
+            try:
+                os.remove(z)
+            except OSError:
+                pass
+        return 0 if ok_ else 1
+    if a.cmd == "telegram-send":
+        meta = read_daemon_meta(a.instance)
+        if not meta or not meta["token"] or not meta["chat"]:
+            _cli_fail(f"scheduler instance '{a.instance}' has no Telegram credentials")
+        if not os.path.isfile(a.file):
+            _cli_fail("file not found")
+        okk, det = send_telegram_backup_archive(a.file, f"PG-Backup panel upload\n{os.path.basename(a.file)}",
+                                                meta["token"], meta["chat"], meta["proxy"])
+        print("sent" if okk else f"failed: {det}")
+        return 0 if okk else 1
+    if a.cmd == "migrate":
+        if not _ensure_components():
+            return 1
+        sys.path.insert(0, COMPONENT_DIR)
+        from pgb.migrate import cli as _mig
+        return _mig.main([x for x in a.rest if x != "--"])
+    return 2
+
 # ── Main menu ─────────────────────────────────────────────────
 MENU = [
     ("1", "Auto Backup & Transfer to New Server"),
@@ -4009,7 +4276,9 @@ MENU = [
     ("4", "Manual Restore (From local zip)"),
     ("5", "Manage Backup Schedulers (start/stop/restart)"),
     ("6", "Update to Latest Version"),
-    ("7", "Exit"),
+    ("7", "Web Panel (install / manage)"),
+    ("8", "Panel Migration (Marzban / Marzneshin / Rebecca / 3x-ui / PasarGuard)"),
+    ("9", "Exit"),
 ]
 
 def main():
@@ -4018,14 +4287,14 @@ def main():
 
         print(f"  {C.R3}{'─' * 50}{C.RESET}")
         for num, label in MENU:
-            if num == "7":
+            if num == "9":
                 print(f"  {C.R3}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.R2}{label}{C.RESET}")
             else:
                 print(f"  {C.R1}{num}{C.RESET}  {C.R3}-{C.RESET}  {C.WH}{label}{C.RESET}")
         print(f"  {C.R3}{'─' * 50}{C.RESET}")
         print()
 
-        choice = input(f"  {C.R2}> Select option (1-7): {C.RESET}").strip()
+        choice = input(f"  {C.R2}> Select option (1-9): {C.RESET}").strip()
         print()
 
         if choice == "1":
@@ -4047,14 +4316,22 @@ def main():
             workflow_update()
             pause_and_return()
         elif choice == "7":
+            workflow_web_panel()
+            pause_and_return()
+        elif choice == "8":
+            workflow_migrate()
+            pause_and_return()
+        elif choice == "9":
             print(f"  {C.R2}Goodbye.{C.RESET}\n")
             sys.exit(0)
         else:
-            print_error("Invalid option. Please enter 1-7.")
+            print_error("Invalid option. Please enter 1-9.")
             time.sleep(1.5)
 
 if __name__ == "__main__":
-    if "--daemon-backup" in sys.argv:
+    if "--cli" in sys.argv[1:2]:
+        sys.exit(run_cli(sys.argv[2:]) or 0)
+    elif "--daemon-backup" in sys.argv:
         run_daemon_from_args()
     else:
         main()
