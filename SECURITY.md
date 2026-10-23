@@ -14,4 +14,4 @@ Report vulnerabilities privately via GitHub Security Advisories on CIAUB/PG-Back
 - Login: scrypt, per-user + per-IP exponential lockout, TOTP (secret encrypted at rest) with replay protection, single-use recovery codes, CSRF header, HttpOnly/SameSite=Strict cookies, logout revokes the session, password change invalidates all sessions.
 - Secrets (bot tokens, SSH credentials, TOTP) are Fernet-encrypted with a 0600 key next to the database. Whoever is root on the box can read both; this protects against copying the DB alone.
 - Panel code is downloaded on demand and each file is checked against a manifest whose hash is embedded in `pg_backup.py`.
-- Known limits: SSH transfer trusts the host key on first use unless you set the fingerprint; PostgreSQL/MySQL migration paths are experimental; the panel runs as root because it manages docker/systemd.
+- Known limits: SSH transfer trusts the host key on first use unless you set the fingerprint; database-engine conversion was tested against a real PostgreSQL but not against real Timescale/MySQL/MariaDB containers; the panel runs as root because it manages docker/systemd.

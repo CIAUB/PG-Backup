@@ -3,17 +3,18 @@
 #   Pasarguard Backup Utility  v5.0.0
 #   Dev by: CIA 
 #   GitHub: https://github.com/CIAUB
-#   v5.0.0 — Web panel + panel-to-panel migration (CC BY-NC-ND):
+#   v5.0.0 — Web panel + database-engine conversion (CC BY-NC-ND):
 #          * NEW optional web panel (menu 7): HTTPS via Caddy, random secret
 #            URL path, scrypt password + TOTP 2FA + rate limiting, backup
 #            manager, scheduler manager with live logs, Telegram settings,
 #            multi-server transfer, live job logs. Installed on demand; the
 #            frozen install.sh is untouched.
-#          * NEW migration engine (menu 8 / --cli migrate): Marzban,
-#            Marzneshin, Rebecca, 3x-ui/x-ui -> PasarGuard and
-#            PasarGuard <-> Marzban, with dry-run, schema checks, conflict
-#            policies and an automatic target backup before any write.
-#          * NEW headless `--cli backup|restore|transfer|telegram-send|migrate`.
+#          * NEW database-engine conversion (menu 8 / --cli convert):
+#            TimescaleDB <-> PostgreSQL and MariaDB <-> MySQL. It reads a
+#            backup zip (or makes a fresh one from this server) and writes a
+#            NEW converted zip. It never restores anything and never changes
+#            the running server.
+#          * NEW headless `--cli backup|restore|transfer|telegram-send|convert`.
 #          * Transfer/restore logic split into reusable functions
 #            (_transfer_to_server, _restore_from_zip); SSH key auth support.
 #          * Components are verified against pgb-manifest.json whose SHA-256
@@ -4078,10 +4079,10 @@ def run_daemon_from_args():
     run_scheduled_backup_loop(token, chat, args.interval, args.node, proxy, args.instance)
 
 # ══════════════════════════════════════════════════════════════
-#  v5.0.0 — optional components (web panel + panel migration)
+#  v5.0.0 — optional components (web panel + database conversion)
 # ══════════════════════════════════════════════════════════════
 # install.sh stays frozen and installs only this single file. The optional
-# `pgb` package (web panel, migration engine) is downloaded on demand and
+# `pgb` package (web panel, database conversion) is downloaded on demand and
 # verified file-by-file against pgb-manifest.json, whose own SHA-256 is
 # embedded below — so the components are bound to THIS script, which the
 # user already trusts (tools/build_manifest.py rewrites the constant at
@@ -4091,7 +4092,7 @@ COMPONENT_DIR      = os.environ.get("PGB_ROOT", "/opt/pg-backup")
 # (vX.Y.Z), not from the moving `main` branch. Publish a tag for every release.
 # PGB_RAW_BASE overrides (tests, mirrors, a fork's main branch).
 COMPONENT_RAW_BASE = os.environ.get("PGB_RAW_BASE", "https://raw.githubusercontent.com/CIAUB/PG-Backup/v5.0.0")
-PGB_MANIFEST_SHA256 = "ed1e66c10bf1a0409121592b16672597baab797e736542fbdf2226744858d765"
+PGB_MANIFEST_SHA256 = "0c23cc54fe948e2f50ad67821d0dab997898574bdb11a11f46887572ed874977"
 PGB_VERSION = "5.0.0"
 
 def _fetch_bytes(url, timeout=40):
@@ -4186,18 +4187,107 @@ def workflow_web_panel():
     if cmd:
         _component_python("-m", "pgb.installer", cmd)
 
-def workflow_migrate():
-    print_header("Panel Migration")
-    print_info("Convert users between PasarGuard / Marzban / Marzneshin / Rebecca / 3x-ui databases.")
-    print_warning("The target database is backed up automatically before anything is written.")
+def workflow_convert_db():
+    print_header("Convert Database Engine")
+    print_info("TimescaleDB <-> PostgreSQL and MariaDB <-> MySQL.")
+    print_info("You get a NEW converted backup file. Nothing is restored and this server is not changed.")
     if not _ensure_components():
         return
-    _component_python("-m", "pgb.migrate.cli")
+    print(f"  {C.R1}1{C.RESET}  {C.WH}Use a backup file I already have{C.RESET}")
+    print(f"  {C.R1}2{C.RESET}  {C.WH}Take a fresh backup of this server first (read-only){C.RESET}")
+    print(f"  {C.R1}0{C.RESET}  {C.WH}Back{C.RESET}")
+    c = input(f"\n  {C.R2}> Select: {C.RESET}").strip()
+    if c == "1":
+        src = input(f"  {C.R2}> Path to the backup .zip: {C.RESET}").strip().strip('"')
+        args = ["--file", src]
+    elif c == "2":
+        args = ["--from-live"]
+    else:
+        return
+    sys.path.insert(0, COMPONENT_DIR)
+    from pgb import dbconv
+    if c == "1":
+        if not os.path.isfile(src):
+            print_error("File not found."); return
+        try:
+            info = dbconv.inspect(src)
+        except Exception as e:
+            print_error(str(e)); return
+        t, targets = info["type"], info["targets"]
+    else:
+        try:
+            t = _detect_backend_local()["type"]
+        except Exception as e:
+            print_error(f"Could not detect the database engine: {e}"); return
+        targets = list(dbconv.supported_targets(t))
+    print_info(f"Current engine: {C.BOLD}{t}{C.RESET}")
+    if not targets:
+        print_error(f"No conversion is available from {t}. Supported: TimescaleDB<->PostgreSQL, MariaDB<->MySQL."); return
+    for i, x in enumerate(targets, 1):
+        print(f"  {C.R1}{i}{C.RESET}  {C.WH}Convert to {x}{C.RESET}")
+    k = input(f"\n  {C.R2}> Select: {C.RESET}").strip()
+    if not k.isdigit() or not 1 <= int(k) <= len(targets):
+        return
+    try:
+        run_cli(["convert", "--to", targets[int(k) - 1]] + args)
+    except SystemExit:
+        pass                                        # _cli_fail already printed the reason
 
 # ── Headless CLI (used by the web panel; also handy for cron/automation) ──
 def _cli_fail(msg, code=1):
     sys.stderr.write(f"[pg-backup] {msg}\n")
     sys.exit(code)
+
+def _cli_convert(a):
+    """Convert a backup to another database engine. Read-only for this server: never restores."""
+    if bool(a.file) == bool(a.from_live):
+        _cli_fail("give exactly one of --file <backup.zip> or --from-live")
+    if not _ensure_components():
+        return 1
+    sys.path.insert(0, COMPONENT_DIR)
+    from pgb import dbconv
+    made = None
+    src = a.file
+    try:
+        if a.from_live:
+            made = create_backup(a.node)           # only reads: pg_dump / file copy
+            if not made:
+                _cli_fail("could not take a backup of this server; nothing was converted")
+            src = made
+        elif not os.path.isfile(src):
+            _cli_fail(f"file not found: {src}")
+        out = a.out
+        if out is None and a.from_live:
+            out = os.path.join(os.getcwd(), f"converted_{a.to}_{os.path.basename(src)}")
+        try:
+            rep = dbconv.convert_zip(src, a.to, out, log=print_info)
+            problems = dbconv.verify_output(rep.out_path, a.to)
+        except dbconv.ConvertError as e:
+            _cli_fail(str(e), 2)
+        for n in rep.notes:
+            print_info(n)
+        for w in rep.warnings:
+            print_warning(w)
+        if problems:
+            for x in problems:
+                print_error(x)
+            try:
+                os.remove(rep.out_path)
+            except OSError:
+                pass
+            _cli_fail("the converted file failed its self-check and was deleted", 3)
+        print_success(f"Converted {rep.source_type} -> {rep.target_type}: {rep.out_path}")
+        print_info("Nothing was restored and this server was not changed.")
+        print_info("To use it: copy the file to the new server and restore it there (menu 4).")
+        print("RESULT " + json.dumps({"zip": rep.out_path}))
+        return 0
+    finally:
+        if made and not a.keep_source:
+            try:
+                os.remove(made)
+            except OSError:
+                pass
+
 
 def run_cli(argv):
     p = argparse.ArgumentParser(prog="PG-Backup --cli", add_help=True)
@@ -4209,7 +4299,11 @@ def run_cli(argv):
     t.add_argument("--user", default="root"); t.add_argument("--node", action="store_true"); t.add_argument("--yes", action="store_true")
     g = sub.add_parser("telegram-send"); g.add_argument("--file", required=True); g.add_argument("--instance", default="default")
     sub.add_parser("version")
-    m = sub.add_parser("migrate"); m.add_argument("rest", nargs=argparse.REMAINDER)
+    cv = sub.add_parser("convert")
+    cv.add_argument("--to", required=True, choices=["postgresql", "timescaledb", "mysql", "mariadb"])
+    cv.add_argument("--file"); cv.add_argument("--from-live", action="store_true")
+    cv.add_argument("--out"); cv.add_argument("--node", action="store_true")
+    cv.add_argument("--keep-source", action="store_true")
     a = p.parse_args(argv)
 
     if a.cmd == "version":
@@ -4260,12 +4354,8 @@ def run_cli(argv):
                                                 meta["token"], meta["chat"], meta["proxy"])
         print("sent" if okk else f"failed: {det}")
         return 0 if okk else 1
-    if a.cmd == "migrate":
-        if not _ensure_components():
-            return 1
-        sys.path.insert(0, COMPONENT_DIR)
-        from pgb.migrate import cli as _mig
-        return _mig.main([x for x in a.rest if x != "--"])
+    if a.cmd == "convert":
+        return _cli_convert(a)
     return 2
 
 # ── Main menu ─────────────────────────────────────────────────
@@ -4277,7 +4367,7 @@ MENU = [
     ("5", "Manage Backup Schedulers (start/stop/restart)"),
     ("6", "Update to Latest Version"),
     ("7", "Web Panel (install / manage)"),
-    ("8", "Panel Migration (Marzban / Marzneshin / Rebecca / 3x-ui / PasarGuard)"),
+    ("8", "Convert Database Engine (TimescaleDB<->PostgreSQL, MariaDB<->MySQL)"),
     ("9", "Exit"),
 ]
 
@@ -4319,7 +4409,7 @@ def main():
             workflow_web_panel()
             pause_and_return()
         elif choice == "8":
-            workflow_migrate()
+            workflow_convert_db()
             pause_and_return()
         elif choice == "9":
             print(f"  {C.R2}Goodbye.{C.RESET}\n")

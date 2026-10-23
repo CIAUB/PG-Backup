@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import time
@@ -25,9 +26,10 @@ from .store import Store
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 COOKIE = "pgb_s"
 SESSION_TTL = 8 * 3600
-NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 BACKUP_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}\.zip$")
 UNIT_BASE = "pasarguard-backup"
+SESSION_BASE = "pasarguard_backup"
 MAX_JSON = 256 * 1024
 TOKEN_RE = re.compile(r"^\d{5,20}:[A-Za-z0-9_-]{20,80}$")
 CHAT_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z0-9_]{4,64})$")
@@ -43,6 +45,7 @@ class Config:
         self.backup_dir = kw.get("backup_dir") or e.get("PGB_BACKUP_DIR", os.path.join(self.state_dir, "backups"))
         self.secure_cookie = kw.get("secure_cookie", e.get("PGB_SECURE_COOKIE", "auto"))
         self.use_systemctl = kw.get("use_systemctl", shutil.which("systemctl") is not None)
+        self.unit_dir = kw.get("unit_dir") or e.get("PGB_UNIT_DIR", "/etc/systemd/system")
 
 
 def _read(path: str) -> str:
@@ -312,36 +315,105 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
                 out.append({"name": n, "size": st.st_size, "mtime": st.st_mtime})
         return sorted(out, key=lambda x: -x["mtime"])
 
+    def unit_of(name: str) -> str:
+        """systemd unit for a scheduler. The terminal menu names the instance after the unit
+        itself (pasarguard-backup-1); schedulers created here may use a short name."""
+        return name if (name == UNIT_BASE or name.startswith(UNIT_BASE + "-")) else f"{UNIT_BASE}-{name}"
+
+    def unit_path(name: str) -> str:
+        return os.path.join(cfg.unit_dir, unit_of(name) + ".service")
+
+    def parse_legacy_unit(path: str) -> Optional[Dict[str, Any]]:
+        """Schedulers made by PG-Backup < 4.2 keep token/chat in ExecStart (no credentials file)."""
+        try:
+            text = _read(path)
+        except OSError:
+            return None
+        line = next((x.strip()[len("ExecStart="):] for x in text.splitlines() if x.strip().startswith("ExecStart=")), "")
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            return None
+        if "--daemon-backup" not in argv:
+            return None
+        out: Dict[str, Any] = {"token": "", "chat": "", "proxy": "", "interval": 1.0, "node": "--node" in argv}
+        for i, a_ in enumerate(argv[:-1]):
+            if a_ in ("--token", "--chat", "--proxy"):
+                out[a_[2:]] = argv[i + 1]
+            elif a_ == "--interval":
+                try:
+                    out["interval"] = float(argv[i + 1])
+                except ValueError:
+                    pass
+        return out
+
+    def live_sessions() -> Dict[str, str]:
+        found: Dict[str, str] = {}
+        for cmd, kind in ((["screen", "-list"], "screen"), (["tmux", "list-sessions", "-F", "#{session_name}"], "tmux")):
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            for ln in r.stdout.splitlines():
+                m = re.search(r"(?:\d+\.)?(" + SESSION_BASE + r"[A-Za-z0-9_-]*)", ln)
+                if m and NAME_RE.match(m.group(1)):
+                    found[m.group(1)] = kind
+        return found
+
     def schedulers() -> List[Dict[str, Any]]:
-        out = []
-        if not os.path.isdir(cfg.creds_dir):
-            return out
+        """Every backup scheduler on this host, however it was created: credentials file (v4.2+),
+        systemd unit (including pre-4.2 units with the token in ExecStart), screen or tmux session."""
         active: Dict[str, str] = {}
         if cfg.use_systemctl:
             try:
                 r = subprocess.run(["systemctl", "list-units", "--all", "--type=service", "--no-legend", "--plain",
                                     f"{UNIT_BASE}-*.service"], capture_output=True, text=True, timeout=15)
                 for ln in r.stdout.splitlines():
-                    p = ln.split()
-                    if p:
-                        active[p[0][:-8]] = p[2] if len(p) > 2 else "?"
+                    pp = ln.split()
+                    if pp and pp[0].endswith(".service"):
+                        active[pp[0][:-8]] = pp[2] if len(pp) > 2 else "?"
             except (OSError, subprocess.SubprocessError):
                 pass
-        for fn in sorted(os.listdir(cfg.creds_dir)):
-            if not fn.endswith(".json"):
-                continue
-            name = fn[:-5]
-            if not NAME_RE.match(name):
-                continue
-            try:
-                m = json.loads(_read(os.path.join(cfg.creds_dir, fn)))
-            except (OSError, ValueError):
-                continue
-            tok = m.get("token", "")
-            out.append({"name": name, "unit": f"{UNIT_BASE}-{name}", "state": active.get(f"{UNIT_BASE}-{name}", "none"),
-                        "interval": m.get("interval"), "node": bool(m.get("node")), "chat": m.get("chat"),
-                        "token_hint": ("…" + tok[-4:]) if tok else "", "proxy": bool(m.get("proxy"))})
-        return out
+        sessions = live_sessions()
+        recs: Dict[str, Dict[str, Any]] = {}
+
+        def add(name: str, meta: Optional[Dict[str, Any]], legacy: bool = False) -> None:
+            u = unit_of(name)
+            if os.path.isfile(unit_path(name)):
+                kind = "systemd"
+            else:
+                kind = sessions.get(name, "none")
+            if kind == "systemd":
+                st = active.get(u, "inactive")
+            else:
+                st = "active" if kind in ("screen", "tmux") else "inactive"
+            tok = (meta or {}).get("token", "")
+            recs[name] = {"name": name, "unit": u, "kind": kind, "state": st, "legacy": legacy, "managed": meta is not None and not legacy,
+                          "interval": (meta or {}).get("interval"), "node": bool((meta or {}).get("node")),
+                          "chat": (meta or {}).get("chat"), "token_hint": ("…" + tok[-4:]) if tok else "",
+                          "proxy": bool((meta or {}).get("proxy"))}
+
+        if os.path.isdir(cfg.creds_dir):
+            for fn in sorted(os.listdir(cfg.creds_dir)):
+                if fn.endswith(".json") and NAME_RE.match(fn[:-5]):
+                    try:
+                        add(fn[:-5], json.loads(_read(os.path.join(cfg.creds_dir, fn))))
+                    except (OSError, ValueError):
+                        continue
+        known_units = {r["unit"] for r in recs.values()}
+        if os.path.isdir(cfg.unit_dir):
+            for fn in sorted(os.listdir(cfg.unit_dir)):
+                if fn.startswith(UNIT_BASE + "-") and fn.endswith(".service") and fn[:-8] not in known_units:
+                    name = fn[:-8]
+                    if NAME_RE.match(name):
+                        meta = parse_legacy_unit(os.path.join(cfg.unit_dir, fn))
+                        add(name, meta, legacy=bool(meta and meta.get("token")))
+        for name in sessions:
+            if name not in recs:
+                add(name, None)
+        return sorted(recs.values(), key=lambda r: r["name"])
 
     @guarded
     async def dashboard(req: Request):
@@ -456,36 +528,199 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
     async def sched_list(req: Request):
         return JSONResponse({"items": schedulers()})
 
+    def find_sched(name: str) -> Optional[Dict[str, Any]]:
+        return next((x for x in schedulers() if x["name"] == name), None) if NAME_RE.match(name or "") else None
+
+    def systemctl(*args: str):
+        return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=60)
+
+    def kill_session(kind: str, name: str) -> None:
+        if kind == "screen":
+            subprocess.run(["screen", "-S", name, "-X", "quit"], capture_output=True, timeout=15)
+        elif kind == "tmux":
+            subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True, timeout=15)
+
     @guarded
     async def sched_action(req: Request):
         name, action = req.path_params["name"], req.path_params["action"]
-        if not NAME_RE.match(name) or action not in ("start", "stop", "restart", "enable", "disable"):
+        rec = find_sched(name)
+        if not rec:
+            return jerr("not found", 404)
+        if action == "upgrade":
+            return upgrade_sched(req, rec)
+        if action not in ("start", "stop", "restart", "enable", "disable"):
             return jerr("bad request")
-        if not cfg.use_systemctl:
-            return jerr("systemd is not available on this host", 501)
-        r = subprocess.run(["systemctl", action, f"{UNIT_BASE}-{name}.service"], capture_output=True, text=True, timeout=60)
+        if rec["kind"] in ("screen", "tmux"):
+            if action != "stop":
+                return jerr("this scheduler runs in " + rec["kind"] + "; use “Convert to service” to manage it here")
+            kill_session(rec["kind"], name)
+        elif rec["kind"] == "systemd":
+            if not cfg.use_systemctl:
+                return jerr("systemd is not available on this host", 501)
+            r = systemctl(action, rec["unit"] + ".service")
+            if r.returncode != 0:
+                return jerr((r.stderr or "systemctl failed").strip()[:300], 500)
+        else:
+            return jerr("this scheduler is not installed; convert or delete it")
         store.audit(req.state.user, client_ip(req), f"scheduler_{action}", name)
-        if r.returncode != 0:
-            return jerr((r.stderr or "systemctl failed").strip()[:300], 500)
         return JSONResponse({"ok": True})
+
+    def upgrade_sched(req: Request, rec: Dict[str, Any]):
+        """Turn an old scheduler (legacy unit with token in ExecStart / screen / tmux / orphan creds)
+        into a normal managed systemd service with credentials in the 0600 file."""
+        name = rec["name"]
+        cpath = os.path.join(cfg.creds_dir, f"{name}.json")
+        meta: Optional[Dict[str, Any]] = None
+        if os.path.isfile(cpath):
+            try:
+                meta = json.loads(_read(cpath))
+            except (OSError, ValueError):
+                meta = None
+        if meta is None and rec["kind"] == "systemd":
+            meta = parse_legacy_unit(unit_path(name))
+        if not meta or not meta.get("token") or not meta.get("chat"):
+            return jerr("no Telegram credentials were found for this scheduler; delete it and create a new one", 409)
+        os.makedirs(cfg.creds_dir, mode=0o700, exist_ok=True)
+        fd = os.open(cpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"token": meta["token"], "chat": str(meta["chat"]), "proxy": meta.get("proxy") or "",
+                       "interval": float(meta.get("interval") or 1.0), "node": bool(meta.get("node"))}, f)
+        if rec["kind"] in ("screen", "tmux"):
+            kill_session(rec["kind"], name)
+        os.makedirs(cfg.unit_dir, exist_ok=True)
+        ufd = os.open(unit_path(name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(ufd, "w") as f:
+            f.write(_unit_text(name, float(meta.get("interval") or 1.0), bool(meta.get("node"))))
+        if cfg.use_systemctl:
+            for cmd in (("daemon-reload",), ("enable", rec["unit"] + ".service"), ("restart", rec["unit"] + ".service")):
+                r = systemctl(*cmd)
+                if r.returncode != 0:
+                    return jerr("upgraded, but systemd said: " + (r.stderr or "failed").strip()[:300], 500)
+        store.audit(req.state.user, client_ip(req), "scheduler_upgrade", name)
+        return JSONResponse({"ok": True, "started": cfg.use_systemctl})
 
     @guarded
     async def sched_logs(req: Request):
         name = req.path_params["name"]
-        if not NAME_RE.match(name) or not cfg.use_systemctl:
-            return jerr("bad request")
-        n = min(max(int(req.query_params.get("n", "150") or 150), 10), 1000)
-        r = subprocess.run(["journalctl", "-u", f"{UNIT_BASE}-{name}.service", "-n", str(n), "--no-pager", "-o", "short-iso"],
+        rec = find_sched(name)
+        if not rec or rec["kind"] != "systemd" or not cfg.use_systemctl:
+            return jerr("logs are only available for systemd services — use “Convert to service”", 400)
+        try:
+            n = min(max(int(req.query_params.get("n", "150") or 150), 10), 1000)
+        except ValueError:
+            n = 150
+        r = subprocess.run(["journalctl", "-u", rec["unit"] + ".service", "-n", str(n), "--no-pager", "-o", "short-iso"],
                            capture_output=True, text=True, timeout=20)
         return JSONResponse({"log": r.stdout[-60000:]})
+
+    def _unit_text(name: str, interval: float, node: bool) -> str:
+        py = shutil.which(cfg.cli[0]) or cfg.cli[0]
+        parts = [py] + list(cfg.cli[1:]) + ["--daemon-backup", "--interval", repr(float(interval)), "--instance", name]
+        if node:
+            parts.append("--node")
+        if any(re.search(r"\s", x) for x in parts):
+            raise ValueError("paths with spaces are not supported")
+        return ("[Unit]\nDescription=PasarGuard Scheduled Backup (" + name + ")\n"
+                "After=network-online.target docker.service\nWants=network-online.target\n\n"
+                "[Service]\nType=simple\nExecStart=" + " ".join(parts) + "\nRestart=always\nRestartSec=10\nUser=root\n\n"
+                "[Install]\nWantedBy=multi-user.target\n")
+
+    @guarded
+    async def sched_create(req: Request):
+        """Create a Telegram backup scheduler (credentials file + systemd service) from the panel."""
+        d = await body(req)
+        name = str(d.get("name") or "").strip()
+        if not name:
+            n = 1
+            while any(os.path.exists(x) for x in (os.path.join(cfg.creds_dir, f"{UNIT_BASE}-{n}.json"),
+                                                    unit_path(f"{UNIT_BASE}-{n}"))):
+                n += 1
+            name = str(n)
+        if not NAME_RE.match(name):
+            return jerr("name may only contain letters, digits, '-' and '_'")
+        name = unit_of(name)                          # same convention as the terminal menu: instance == unit name
+        if not NAME_RE.match(name):
+            return jerr("name is too long")
+        token, chat = str(d.get("token", "")).strip(), str(d.get("chat", "")).strip()
+        proxy = str(d.get("proxy") or "").strip()
+        if not TOKEN_RE.match(token):
+            return jerr("invalid bot token format (looks like 123456789:AA…)")
+        if not CHAT_RE.match(chat):
+            return jerr("invalid chat id (a number like 123456789 or -100…, or @channel)")
+        if proxy and not PROXY_RE.match(proxy):
+            return jerr("proxy must look like socks5://host:port or http://host:port")
+        try:
+            iv = float(d.get("interval", 1))
+        except (TypeError, ValueError):
+            return jerr("interval must be a number of hours")
+        if not 0.05 <= iv <= 24 * 30:
+            return jerr("interval out of range")
+        path = os.path.join(cfg.creds_dir, f"{name}.json")
+        if os.path.exists(path) or os.path.exists(unit_path(name)):
+            return jerr("a scheduler with this name already exists", 409)
+        if d.get("test", True):                       # fail early on a wrong token / chat id
+            ok_, msg = await asyncio.get_running_loop().run_in_executor(None, tg.test, token, chat, proxy or None)
+            if not ok_:
+                return jerr("Telegram test failed: " + msg, 400)
+        try:
+            unit = _unit_text(name, iv, bool(d.get("node")))
+        except ValueError as e:
+            return jerr(str(e), 500)
+        os.makedirs(cfg.creds_dir, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"token": token, "chat": chat, "proxy": proxy, "interval": iv, "node": bool(d.get("node"))}, f)
+        os.makedirs(cfg.unit_dir, exist_ok=True)
+        upath = unit_path(name)
+        ufd = os.open(upath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(ufd, "w") as f:
+            f.write(unit)
+        started, err = False, ""
+        if cfg.use_systemctl:
+            unit_name = unit_of(name) + ".service"
+            for cmd in (["systemctl", "daemon-reload"], ["systemctl", "enable", unit_name],
+                        ["systemctl", "restart", unit_name]):
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if r.returncode != 0:
+                    err = (r.stderr or "systemctl failed").strip()[:300]
+                    break
+            else:
+                started = True
+        store.audit(req.state.user, client_ip(req), "scheduler_create", name)
+        if err:
+            return jerr("scheduler saved but could not be started: " + err, 500, name=name)
+        return JSONResponse({"ok": True, "name": name, "started": started})
+
+    @guarded
+    async def sched_delete(req: Request):
+        name = req.path_params["name"]
+        rec = find_sched(name)
+        if not rec:
+            return jerr("not found", 404)
+        if rec["kind"] in ("screen", "tmux"):
+            kill_session(rec["kind"], name)
+        if cfg.use_systemctl and rec["kind"] == "systemd":
+            systemctl("disable", "--now", rec["unit"] + ".service")
+        for p_ in (unit_path(name) if rec["kind"] == "systemd" else None, os.path.join(cfg.creds_dir, f"{name}.json")):
+            if p_:
+                try:
+                    os.remove(p_)
+                except OSError:
+                    pass
+        if cfg.use_systemctl:
+            systemctl("daemon-reload")
+        store.audit(req.state.user, client_ip(req), "scheduler_delete", name)
+        return JSONResponse({"ok": True})
 
     @guarded
     async def sched_update(req: Request):
         name = req.path_params["name"]
         d = await body(req)
         path = os.path.join(cfg.creds_dir, f"{name}.json")
-        if not NAME_RE.match(name) or not os.path.isfile(path):
+        if not NAME_RE.match(name) or not find_sched(name):
             return jerr("not found", 404)
+        if not os.path.isfile(path):
+            return jerr("this is an old-style scheduler: click “Convert to service” first", 409)
         data = json.loads(_read(path))
         if d.get("token"):
             tok = str(d["token"]).strip()
@@ -518,7 +753,7 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
         os.chmod(path, 0o600)
         store.audit(req.state.user, client_ip(req), "scheduler_update", name)
         if d.get("restart") and cfg.use_systemctl:
-            subprocess.run(["systemctl", "restart", f"{UNIT_BASE}-{name}.service"], capture_output=True, timeout=60)
+            subprocess.run(["systemctl", "restart", unit_of(name) + ".service"], capture_output=True, timeout=60)
         return JSONResponse({"ok": True})
 
     @guarded
@@ -609,96 +844,51 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
         store.audit(req.state.user, client_ip(req), "transfer", srv["host"])
         return JSONResponse({"job": jid})
 
-    # ------------------------------------------------------------------ migration
-    @guarded
-    async def mig_discover(req: Request):
-        from ..migrate.discover import discover
-        return JSONResponse({"items": discover()})
-
-    def _inside(p: str, root: str) -> bool:
-        p, root = os.path.realpath(p), os.path.realpath(root)
-        return p == root or p.startswith(root + os.sep)
-
-    def open_endpoint(spec: Dict[str, Any], writable: bool):
-        """Open a panel DB. User-supplied paths are validated: they must be a real
-        SQLite file (or a compose dir) and never the panel's own state/credentials."""
-        from ..migrate.discover import KNOWN, open_panel
-        kind = str(spec.get("kind", ""))
-        if kind not in KNOWN:
-            raise ValueError("unknown panel kind")
-        path, d = spec.get("path") or None, spec.get("dir") or None
-        for label, v in (("path", path), ("dir", d)):
-            if v is None:
-                continue
-            if not isinstance(v, str) or "\0" in v or not os.path.isabs(v):
-                raise ValueError(f"{label} must be an absolute path")
-            for forbidden in (cfg.state_dir, cfg.creds_dir):
-                if _inside(v, forbidden):
-                    raise ValueError(f"{label} points into a protected directory")
-        if path:
-            if not os.path.isfile(path):
-                raise ValueError("database file not found")
-            with open(path, "rb") as fh:
-                if fh.read(16) != b"SQLite format 3\x00":
-                    raise ValueError("not a SQLite database")
-        if d and not os.path.isdir(d):
-            raise ValueError("directory not found")
-        return open_panel(kind, d, path, writable=writable)
-
-    def build_opts(d: Dict[str, Any]):
-        from ..migrate.writers import MigrationOptions
-        o = d.get("options") or {}
-        allowed = {"conflict", "admin_mode", "target_admin", "create_missing_admins", "group_mode", "group_name",
-                   "existing_groups", "preserve_usage", "rename_suffix", "auth_algorithm"}
-        opts = MigrationOptions(**{k: v for k, v in o.items() if k in allowed})
-        opts.validate()
-        return opts
-
-    def migration_report(d: Dict[str, Any], apply: bool, log=lambda m: None):
-        from ..migrate.discover import backup_target, restart_panel
-        from ..migrate.engine import run
-        src = open_endpoint(d["source"], False)
-        tgt = open_endpoint(d["target"], apply)
-        try:
-            bdir = os.path.join(cfg.backup_dir, "pre-migration")
-            rep = run(src, tgt, d["target"]["kind"], opts=build_opts(d), apply=apply,
-                      backup=(lambda: backup_target(tgt, bdir)) if apply else None, log=log)
-            if apply and rep.applied and d.get("restart", True):
-                log(restart_panel(d["target"]["kind"], d["target"].get("dir")))
-            return rep
-        finally:
-            src.close()
-            tgt.close()
+    # ------------------------------------------------------------------ database conversion
+    # Produces a NEW converted backup zip in the backup folder. It never restores anything.
+    CONVERT_TARGETS = ("postgresql", "timescaledb", "mysql", "mariadb")
 
     @guarded
-    async def mig_plan(req: Request):
-        d = await body(req)
+    async def convert_inspect(req: Request):
+        from .. import dbconv
+        p = safe_backup(req.path_params["name"])
+        if not p:
+            return jerr("not found", 404)
         try:
-            rep = await asyncio.get_running_loop().run_in_executor(None, migration_report, d, False)
+            info = await asyncio.get_running_loop().run_in_executor(None, dbconv.inspect, p)
         except Exception as e:
-            return jerr(str(e))
-        out = rep.to_dict()
-        out["skipped"] = out["skipped"][:200]
-        out["renamed"] = out["renamed"][:200]
-        return JSONResponse(out)
+            return JSONResponse({"type": "", "targets": [], "error": str(e)[:200]})
+        return JSONResponse(info)
 
     @guarded
-    async def mig_apply(req: Request):
+    async def convert_start(req: Request):
+        from .. import dbconv
         busy = one_job_at_a_time()
         if busy:
             return busy
         d = await body(req)
-        if d.get("confirm") != "MIGRATE":
-            return jerr("type MIGRATE to confirm")
-
-        def work(log):
-            rep = migration_report(d, True, log)
-            log(json.dumps(rep.to_dict(), ensure_ascii=False, default=str, indent=1))
-            return 0 if rep.ok and rep.applied else 1
-
-        store.audit(req.state.user, client_ip(req), "migration_apply",
-                    f"{d.get('source', {}).get('kind')}->{d.get('target', {}).get('kind')}")
-        return JSONResponse({"job": jobs.run_callable("migrate", "Panel migration", work)})
+        to = str(d.get("to", ""))
+        if to not in CONVERT_TARGETS:
+            return jerr("unknown target engine")
+        src = str(d.get("source", ""))
+        if src == "live":
+            argv = run_cli("convert", "--from-live", "--to", to)
+            title = f"Convert this server's backup to {to}"
+        else:
+            p = safe_backup(src)
+            if not p:
+                return jerr("backup not found", 404)
+            try:
+                info = dbconv.inspect(p)
+            except Exception as e:
+                return jerr(str(e)[:200])
+            if to not in info["targets"]:
+                return jerr(f"{info['type']} → {to} is not supported")
+            argv = run_cli("convert", "--file", p, "--to", to)
+            title = f"Convert {src} to {to}"
+        jid = jobs.start("convert", title, argv, cwd=cfg.backup_dir)
+        store.audit(req.state.user, client_ip(req), "db_convert", f"{src}->{to}")
+        return JSONResponse({"job": jid})
 
     # ------------------------------------------------------------------ jobs
     @guarded
@@ -775,14 +965,15 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
         Route("/backups/{name}/download", backup_download), Route("/backups/{name}", backup_delete, methods=["DELETE"]),
         Route("/backups/{name}/restore", backup_restore, methods=["POST"]),
         Route("/backups/{name}/telegram", backup_to_telegram, methods=["POST"]),
-        Route("/schedulers", sched_list), Route("/schedulers/{name}/logs", sched_logs),
+        Route("/schedulers", sched_list), Route("/schedulers/create", sched_create, methods=["POST"]),
+        Route("/schedulers/{name}", sched_delete, methods=["DELETE"]),
+        Route("/schedulers/{name}/logs", sched_logs),
         Route("/schedulers/{name}/update", sched_update, methods=["POST"]),
         Route("/schedulers/{name}/{action}", sched_action, methods=["POST"]),
         Route("/telegram/test", telegram_test, methods=["POST"]),
         Route("/servers", servers_list), Route("/servers/add", servers_add, methods=["POST"]),
         Route("/servers/{sid}", servers_delete, methods=["DELETE"]), Route("/transfer", transfer, methods=["POST"]),
-        Route("/migrate/discover", mig_discover), Route("/migrate/plan", mig_plan, methods=["POST"]),
-        Route("/migrate/apply", mig_apply, methods=["POST"]),
+        Route("/convert/{name}", convert_inspect), Route("/convert", convert_start, methods=["POST"]),
         Route("/jobs", jobs_list), Route("/jobs/{jid:int}", job_get),
         Route("/jobs/{jid:int}/cancel", job_cancel, methods=["POST"]), Route("/jobs/{jid:int}/stream", job_stream),
         Route("/audit", audit_list),

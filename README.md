@@ -2,7 +2,7 @@
 
 <div align="center">
 
-### Professional Backup, Restore & Migration Utility for PasarGuard & PG-Node
+### Professional Backup, Restore & Database Conversion Utility for PasarGuard & PG-Node
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=20&pause=1000&color=8B0000&center=true&vCenter=true&width=500&lines=Sharingan-sharp+Backups;Silent+Migration%2C+Zero+Downtime;All+5+Backends+Auto--Detected;Hardened+%26+Security--Audited" alt="Typing SVG" />
 
@@ -17,7 +17,7 @@
 ![MariaDB](https://img.shields.io/badge/MariaDB-Supported-8B0000)
 ![Multi-DB](https://img.shields.io/badge/Multi--Database-Auto--Detected-8B0000)
 
-Backup • Restore • Migration • Telegram Automation • All 5 Backends • Docker
+Backup • Restore • DB Conversion • Telegram Automation • All 5 Backends • Docker
 
 ![License](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-8B0000)
 
@@ -45,9 +45,9 @@ Backup • Restore • Migration • Telegram Automation • All 5 Backends • 
 
 # 🚀 معرفی
 
-**PG-Backup** یک ابزار حرفه‌ای برای تهیه نسخه پشتیبان، ریستور و مهاجرت سرویس‌های **PasarGuard** و **PG-Node** است — با تشخیص خودکار بک‌اند، انتقال کامل بین سرورها، ارسال خودکار به تلگرام و بازیابی سریع.
+**PG-Backup** یک ابزار حرفه‌ای برای تهیه نسخه پشتیبان، ریستور و تبدیل دیتابیس سرویس‌های **PasarGuard** و **PG-Node** است — با تشخیص خودکار بک‌اند، انتقال کامل بین سرورها، ارسال خودکار به تلگرام و بازیابی سریع.
 
-> 🆕 **v5.0.0** — **پنل تحت وب** (HTTPS خودکار، مسیر مخفی، 2FA) و **مهاجرت بین پنل‌ها** (Marzban / Marzneshin / Rebecca / 3x-ui ← PasarGuard و PasarGuard ⇄ Marzban). جزئیات: [🌐 پنل وب](#-پنل-تحت-وب) و [🔀 مهاجرت پنل](#-مهاجرت-بین-پنل‌ها).
+> 🆕 **v5.0.0** — **پنل تحت وب** (HTTPS خودکار، مسیر مخفی، 2FA) و **تبدیل نوع دیتابیس** (TimescaleDB ⇄ PostgreSQL و MariaDB ⇄ MySQL؛ خروجی یک فایل بکاپ جدید است و چیزی ریستور نمی‌شود). جزئیات: [🌐 پنل وب](#-پنل-تحت-وب) و [🔀 تبدیل دیتابیس](#-تبدیل-نوع-دیتابیس).
 >
 > **v4.2.9** — رفع باگ مسیر نسبی `db_dump` در **Manual Restore (محلی)**: ریستور دیتابیس محلی، مسیر manifest را نسبت به دایرکتوری فعلی اجرای اسکریپت جست‌وجو می‌کرد نه `/opt/pasarguard`، و در نتیجه با خطای کاذب «manifest.tsv not found» متوقف می‌شد حتی وقتی استخراج آرشیو کاملاً موفق بود. اکنون مسیر همیشه مطلق (`/opt/pasarguard/db_dump`) resolve می‌شود — برای **هر پنج بک‌اند** (SQLite، PostgreSQL، TimescaleDB، MySQL، MariaDB). جزئیات در [📜 تغییرات نسخه](#-تغییرات-نسخه).
 
@@ -130,7 +130,7 @@ PG-Backup
 5 ─ 🧭 Manage Backup Schedulers
 6 ─ ⬆️ Update to Latest Version
 7 ─ 🌐 Web Panel (install / manage)
-8 ─ 🔀 Panel Migration
+8 ─ 🔀 Convert Database Engine
 9 ─ 🚪 Exit
 ```
 
@@ -195,7 +195,7 @@ Telegram Bot Token / Chat ID (اختیاری)
 | 📦 بکاپ‌ها | ساخت، آپلود، دانلود، حذف، ریستور (با تأیید تایپی) و ارسال به تلگرام |
 | ⏰ زمان‌بندها | شروع/توقف/ری‌استارت، ویرایش توکن، Chat ID، پروکسی و فاصله، **لاگ زنده**، تست ارسال تلگرام |
 | 🖧 چندسرور | ثبت سرورها (اعتبارنامه رمزنگاری‌شده) و انتقال با یک کلیک؛ ورود با رمز یا کلید SSH |
-| 🔀 مهاجرت | ویزارد کامل با پیش‌نمایش (dry-run) و لاگ زنده |
+| 🔀 تبدیل دیتابیس | ساخت بکاپ تبدیل‌شده (Timescale⇄PostgreSQL، MariaDB⇄MySQL) با لاگ زنده |
 | 📜 لاگ کارها | همه‌ی عملیات با پخش زنده (SSE) و گزارش رویدادها (audit) |
 
 مدیریت از ترمینال: وضعیت/آدرس، ریست رمز، غیرفعال‌کردن 2FA (اگر دستگاه را گم کردید)، حذف پنل — همه در همان منو.
@@ -204,27 +204,35 @@ Telegram Bot Token / Chat ID (اختیاری)
 
 ---
 
-# 🔀 مهاجرت بین پنل‌ها
+# 🔀 تبدیل نوع دیتابیس
 
-از منوی **8 — Panel Migration** یا از پنل وب. مسیرهای پشتیبانی‌شده:
+از منوی **8 — Convert Database Engine** یا از پنل وب (صفحه‌ی «تبدیل دیتابیس»). این ابزار از **یک فایل بکاپ PG-Backup** یک **فایل بکاپ جدید** با نوع دیگری از دیتابیس می‌سازد:
 
-* **Marzban → PasarGuard**، **Marzneshin → PasarGuard**، **Rebecca → PasarGuard**، **3x-ui / x-ui → PasarGuard**
-* **PasarGuard → PasarGuard** (بین دو نصب/بک‌اند مختلف) و **PasarGuard → Marzban**
+| از | به |
+|---|---|
+| TimescaleDB | PostgreSQL |
+| PostgreSQL | TimescaleDB |
+| MariaDB | MySQL |
+| MySQL | MariaDB |
 
-**چطور کار می‌کند:** دیتابیس مبدا فقط‌خواندنی (روی یک کپی) خوانده می‌شود ← مدل میانی ← نوشتن در دیتابیس مقصد داخل **یک تراکنش**. پیش از نوشتن: ساختار جدول‌های مقصد بررسی می‌شود (اگر پنل مقصد ستون اجباری جدیدی دارد که اسکریپت نمی‌شناسد، متوقف می‌شود)، **پیش‌نمایش کامل** نشان داده می‌شود و از دیتابیس مقصد **بکاپ خودکار** گرفته می‌شود؛ اگر بکاپ شکست بخورد چیزی نوشته نمی‌شود. بعد از اتمام، پنل مقصد ری‌استارت می‌شود (PasarGuard کاربران را در حافظه نگه می‌دارد).
+**نکته‌های مهم**
 
-**چه چیزهایی منتقل می‌شود:** کاربران، وضعیت، حجم و مصرف، انقضا، on-hold، ریست حجم، یادداشت، ادمین‌ها (با نقش Administrator/Operator؛ هرگز Owner جدید ساخته نمی‌شود)، گروه‌ها/سرویس‌ها، و اعتبارنامه‌های پروکسی (UUID و رمزها) تا کاربران **لینک اشتراک/کانفیگ قبلی را بدون تغییر** نگه دارند. کلید کاربران Marzneshin طبق `xxh128` و Rebecca طبق کلیدش بازتولید می‌شود.
+* **چیزی ریستور نمی‌شود و سرور فعلی تغییری نمی‌کند.** فایل مبدا فقط خوانده می‌شود؛ خروجی یک فایل جدید به نام `converted_<نوع>_<نام‌اصلی>.zip` است.
+* منبع می‌تواند یک بکاپ موجود باشد یا «یک بکاپ تازه از همین سرور» (فقط خواندن؛ بعد از تبدیل، بکاپ میانی پاک می‌شود و فقط فایل تبدیل‌شده می‌ماند).
+* فایل تبدیل‌شده را روی **سرور جدید** با منوی ۴ (Manual Restore) ریستور کنید؛ `docker-compose.yml` داخل آن با ایمیج دیتابیس جدید تنظیم شده است.
+* TimescaleDB → PostgreSQL: اکستنشن و آبجکت‌های داخلی Timescale حذف می‌شوند و داده‌ی هر hypertable داخل جدول معمولی همان قرار می‌گیرد. اگر Continuous Aggregate داشته باشید حذف می‌شود و هشدار می‌گیرید.
+* PostgreSQL → TimescaleDB: دامپ همان‌طور که هست بارگذاری می‌شود (جدول‌ها معمولی می‌مانند و ایمیج Timescale جایگزین می‌شود).
+* MariaDB ⇄ MySQL: collationها و کامنت‌های نسخه‌ای ناسازگار اصلاح می‌شود.
+* فایل‌های خام دیتابیس قدیمی (اگر پوشه‌ی دیتای دیتابیس داخل `/var/lib/pasarguard` باشد) داخل فایل جدید گذاشته نمی‌شوند.
+* **تبدیل بین خانواده‌های مختلف (SQLite ⇄ PostgreSQL ⇄ MySQL) عمداً وجود ندارد**؛ ساختار جدول‌ها را خود PasarGuard با alembic می‌سازد و حدس‌زدن آن ریسک از دست رفتن داده دارد.
+* بعد از ساخت، فایل خروجی یک بررسی خودکار می‌شود؛ اگر خراب باشد پاک می‌شود.
 
-**سیاست تداخل نام کاربری:** `skip` (پیش‌فرض)، `rename` (پسوند `_m`) یا `update`. نام‌های نامعتبر خودکار پاک‌سازی می‌شوند.
-
-**وضعیت تست:** مسیرهای SQLite با تست خودکار پوشش داده شده‌اند. اجرا روی PostgreSQL/TimescaleDB/MySQL/MariaDB داخل Docker از همان کد (دستورهای پارامتری سازگار با هر دیالکت) استفاده می‌کند اما هنوز روی نصب واقعی آزمایش نشده؛ حتماً ابتدا `--dry-run` بزنید و از بکاپ خودکار مقصد (`pre-migration/`) مطمئن باشید.
-
-**محدودیت‌های شناخته‌شده:** اینباندها/هاست‌ها و تنظیمات Xray منتقل نمی‌شوند (باید در پنل مقصد تعریف باشند و گروه‌ها به آن‌ها وصل شوند)؛ `flow` ویژه‌ی کاربر Marzban در PasarGuard روی هاست تنظیم می‌شود؛ شناسه‌ی اشتراک و محدودیت IP در 3x-ui منتقل نمی‌شود؛ متد Shadowsocks‌های 2022 معادل ندارد.
+**وضعیت تست:** منطق تبدیل با تست خودکار و بارگذاری خروجی در یک PostgreSQL واقعی بررسی شده است. دامپ واقعی Timescale و ایمیج‌های واقعی Docker (Timescale / MySQL / MariaDB) در محیط توسعه موجود نبودند؛ پیش از استفاده روی سرور اصلی، یک‌بار ریستور را روی یک سرور آزمایشی امتحان کنید.
 
 ```bash
-# حالت غیرتعاملی
-PG-Backup --cli migrate --from marzban --to pasarguard --dry-run
-PG-Backup --cli migrate --from 3xui:/etc/x-ui/x-ui.db --to pasarguard --apply --yes --conflict rename
+# غیرتعاملی
+PG-Backup --cli convert --file backup_full_2026.zip --to postgresql
+PG-Backup --cli convert --from-live --to postgresql      # بکاپ تازه از همین سرور، فقط فایل تبدیل‌شده می‌ماند
 ```
 
 ---
@@ -236,6 +244,8 @@ PG-Backup --cli migrate --from 3xui:/etc/x-ui/x-ui.db --to pasarguard --apply --
 * فایل‌های >50MB به‌صورت خودکار به قطعات `.001` `.002` ... تقسیم می‌شوند و در Manual Restore به‌صورت خودکار شناسایی، verify و بازچسبانده می‌شوند.
 * ماندگاری شِدیولر بعد از بستن SSH: `None` / `screen` / `tmux` / `systemd`، هرکدام با یک نام نمونه (Instance Name) اعتبارسنجی‌شده.
 * توکن بات و Chat ID هرگز روی CLI یا unit فایل نیستند — در فایل `0600` جدا در `/etc/pasarguard-backup/<instance>.json` ذخیره می‌شوند.
+
+**از پنل وب:** صفحه‌ی «زمان‌بندی و تلگرام» ← «زمان‌بندی جدید» ← توکن ربات، Chat ID و بازه را وارد کنید؛ قبل از ساخت یک پیام آزمایشی ارسال می‌شود و سرویس systemd ساخته و اجرا می‌شود (حذف هم از همان‌جاست).
 
 از منوی «مدیریت شِدیولرها» (گزینه ۵) می‌توان هر شِدیولر را **Restart** (بدون حذف/بازسازی)، **Stop**، **Remove** یا توکن/Chat ID آن را **Update** کرد.
 

@@ -26,7 +26,7 @@ a{color:var(--ac)}button,input,select,textarea{font:inherit;color:inherit}
 .side .sp{flex:1}
 .main{padding:28px clamp(16px,3vw,40px);max-width:1200px;width:100%}
 h1{font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0 0 4px}h2{font-size:16px;font-weight:600;letter-spacing:-.01em;margin:0 0 12px}html[lang=fa] h1,html[lang=fa] h2{letter-spacing:0}.sub{color:var(--mut);margin:0 0 22px}
-.grid{display:grid;gap:14px}.g4{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}.g2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.grid{display:grid;gap:14px}.g4{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}.g2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}.g3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:18px}
 .stat .k{color:var(--mut);font-size:13px}.stat .v{font-size:28px;font-weight:700;letter-spacing:-.02em;margin-top:2px;font-variant-numeric:tabular-nums}.stat .s{color:var(--mut);font-size:12px}
 .meter{height:7px;border-radius:9px;background:var(--card2);overflow:hidden;margin-top:10px}.meter i{display:block;height:100%;background:linear-gradient(90deg,var(--ac2),var(--ac));border-radius:9px}

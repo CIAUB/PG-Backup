@@ -5,15 +5,17 @@
 ## v5.0.0 — security hardening pass (pre-release review)
 - install.sh rewritten: release-tag source, SHA-256 verification (`pg_backup.py.sha256`, optional `--sha256`), private temp dir, atomic install, syntax check, no cache-buster/predictable /tmp path.
 - In-app updater no longer offers to run an unverified installer.
-- Panel: migration path allowlist (state/credentials dirs blocked, real SQLite only), JSON body cap, session revocation on logout, encrypted TOTP secret, constant-time username compare, security headers + no-store, Telegram/proxy validation.
-- Fewer errors: unknown NOT NULL columns from a different panel version are filled with neutral defaults (reported as warnings; only un-guessable types still block); wrong/stale DB credentials fall back to those in the panel's .env / the DB container environment / passwordless local socket.
+- Panel: JSON body cap, session revocation on logout, encrypted TOTP secret, constant-time username compare, security headers + no-store, Telegram/proxy validation.
+- Panel: schedulers made by the terminal menu / pre-4.2 versions / screen / tmux are now listed (the panel built the wrong unit name `pasarguard-backup-pasarguard-backup-1`), with a “Convert to service” action.
+- NEW database-engine conversion (menu 8, `--cli convert`, panel page): TimescaleDB ⇄ PostgreSQL and MariaDB ⇄ MySQL. Reads a backup zip (or a fresh read-only backup of this server) and writes a NEW converted zip; never restores and never touches the running server. Cross-family conversion (SQLite/PostgreSQL/MySQL) is deliberately not offered.
+- Panel: create/delete Telegram backup schedulers from the web UI (was only possible from the terminal menu).
 - DB passwords are passed to docker via environment, not argv. Optional SSH host-key pinning. Caddy/systemd hardening, email/domain validation.
 
-## v5.0.0 — پنل تحت وب + مهاجرت بین پنل‌ها
+## v5.0.0 — پنل تحت وب + تبدیل نوع دیتابیس
 
 * **پنل تحت وب (اختیاری، منوی 7):** سرویس جدا (Starlette + uvicorn) با رابط فارسی RTL، پشت Caddy با HTTPS خودکار (Let's Encrypt برای دامنه، یا گواهی داخلی برای IP) و مسیر مخفی تصادفی. ورود با رمز scrypt، TOTP + کد بازیابی، قفل موقت پس از تلاش ناموفق، نشست امضاشده و محافظت CSRF. محدودیت IP عمداً وجود ندارد. مدیریت بکاپ‌ها، زمان‌بندها (با لاگ زنده)، تنظیمات تلگرام (+ تست ارسال)، چندسرور و انتقال، و لاگ زنده‌ی کارها.
-* **موتور مهاجرت (منوی 8 و `--cli migrate`):** Marzban / Marzneshin / Rebecca / 3x-ui ← PasarGuard و PasarGuard ⇄ Marzban، با dry-run، بررسی ساختار جدول مقصد، سیاست تداخل نام، نگاشت ادمین/گروه، تراکنش واحد، بکاپ خودکار مقصد قبل از نوشتن و ری‌استارت پنل مقصد. پشتیبانی از SQLite (تست‌شده) و PostgreSQL/TimescaleDB/MySQL/MariaDB داخل Docker (آزمایشی — هنوز روی نصب واقعی تست نشده).
-* **CLI بدون پرسش:** `--cli backup | restore | transfer | telegram-send | migrate`؛ اعتبارنامه‌ها فقط از متغیر محیطی/فایل 0600، نه آرگومان خط فرمان.
+* **تبدیل نوع دیتابیس (منوی 8 و `--cli convert`):** TimescaleDB ⇄ PostgreSQL و MariaDB ⇄ MySQL. از یک فایل بکاپ (یا بکاپ تازه‌ی همین سرور) یک فایل بکاپ **جدید** می‌سازد؛ هیچ ریستوری انجام نمی‌شود و سرور فعلی دست نمی‌خورد.
+* **CLI بدون پرسش:** `--cli backup | restore | transfer | telegram-send | convert`؛ اعتبارنامه‌ها فقط از متغیر محیطی/فایل 0600، نه آرگومان خط فرمان.
 * بازآرایی: منطق انتقال و ریستور به توابع قابل‌استفاده‌ی مجدد (`_transfer_to_server`، `_restore_from_zip`) تقسیم شد؛ انتقال با **کلید SSH** هم پشتیبانی می‌شود.
 * اجزای اضافی (پکیج `pgb`) هنگام نیاز دانلود می‌شوند و فایل‌به‌فایل با `pgb-manifest.json` — که SHA-256 آن داخل همین اسکریپت جاسازی شده — راستی‌آزمایی می‌شوند. `install.sh` تغییری نکرده است.
 * منوی اصلی: گزینه‌ی خروج از 7 به **9** منتقل شد.

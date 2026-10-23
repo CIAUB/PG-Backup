@@ -106,7 +106,7 @@
   /* ---------- shell ---------- */
   var PAGES = [
     ["dashboard", "nav.dashboard", "home"], ["backups", "nav.backups", "db"], ["schedulers", "nav.schedulers", "clock"],
-    ["servers", "nav.servers", "server"], ["migrate", "nav.migrate", "swap"], ["jobs", "nav.jobs", "list"], ["security", "nav.security", "shield"]
+    ["servers", "nav.servers", "server"], ["convert", "nav.convert", "swap"], ["jobs", "nav.jobs", "list"], ["security", "nav.security", "shield"]
   ];
   function shell(active, content) {
     var side = h("aside", { class: "side", id: "side" },
@@ -233,9 +233,25 @@
     function load() {
       api("/schedulers").then(function (d) {
         clear(box);
+        box.appendChild(h("div", { class: "row", style: "margin-bottom:14px" }, btn("＋ " + t("sc.new"), createSched, "pri")));
         if (!d.items.length) { box.appendChild(h("div", { class: "card empty" }, t("sc.none"))); return; }
         d.items.forEach(function (s) { box.appendChild(card(s)); });
       }).catch(fail);
+    }
+    function createSched() {
+      var name = h("input", { type: "text", class: "ltr", placeholder: "backup-1", maxlength: 64 }),
+        tok = h("input", { type: "password", class: "ltr", placeholder: "123456789:AA…", autocomplete: "off" }),
+        chat = h("input", { type: "text", class: "ltr", placeholder: "123456789 / -100… / @channel" }),
+        proxy = h("input", { type: "text", class: "ltr", placeholder: t("sc.proxyPh") }),
+        iv = h("input", { type: "number", step: "0.25", min: "0.05", value: 1 }), node = h("input", { type: "checkbox" });
+      modal(t("sc.new"), h("div", null, h("p", { class: "note" }, t("sc.newHint")),
+        h("div", { class: "grid g2" }, field(t("sc.token"), tok), field(t("sc.chat"), chat), field(t("sc.interval"), iv), field(t("sc.name"), name)),
+        field(t("sc.proxy"), proxy), h("label", { class: "chk" }, node, t("sc.node"))), function (c) {
+        return [btn(t("c.cancel"), c), btn(t("sc.create"), function () {
+          api("/schedulers/create", { body: { name: name.value, token: tok.value, chat: chat.value, proxy: proxy.value, interval: iv.value, node: node.checked } })
+            .then(function () { c(); toast(t("sc.created")); load(); }).catch(fail);
+        }, "pri")];
+      });
     }
     function card(s) {
       var tok = h("input", { type: "password", class: "ltr", placeholder: t("sc.tokenKeep", { hint: s.token_hint || "—" }), autocomplete: "off" }),
@@ -255,15 +271,23 @@
         function pull() { api("/schedulers/" + s.name + "/logs?n=200").then(function (r) { if (!logBox) return; logBox.textContent = r.log || t("c.emptyLog"); logBox.scrollTop = logBox.scrollHeight; }).catch(function () { }); }
         pull(); logTimer = setInterval(pull, 3000); state.timers.push(logTimer);
       }
+      var isSvc = s.kind === "systemd", managed = s.managed;
+      var kindPill = h("span", { class: "pill" }, isSvc ? "systemd" : s.kind === "none" ? t("sc.notInstalled") : s.kind);
+      var controls = h("div", { class: "row" });
+      if (isSvc) { controls.appendChild(btn(t("c.start"), act("start"), "sm")); controls.appendChild(btn(t("c.stop"), act("stop"), "sm")); controls.appendChild(btn(t("c.restart"), act("restart"), "sm")); controls.appendChild(btn(t("sc.logs"), toggleLogs, "sm")); }
+      else if (s.kind === "screen" || s.kind === "tmux") controls.appendChild(btn(t("c.stop"), act("stop"), "sm"));
+      controls.appendChild(btn(t("c.delete"), function () { if (window.confirm(t("sc.removeQ", { name: s.name }))) api("/schedulers/" + s.name, { method: "DELETE" }).then(function () { toast(t("c.done")); load(); }).catch(fail); }, "sm bad"));
       var el = h("div", { class: "card", style: "margin-bottom:14px" },
-        h("div", { class: "row sb", style: "margin-bottom:12px" }, h("h2", { style: "margin:0" }, s.name, " ", h("span", { class: "pill " + (s.state === "active" ? "ok" : "bad") }, s.state === "active" ? t("st.active") : s.state === "none" ? t("sc.notInstalled") : t("st.stopped"))),
-          h("div", { class: "row" }, btn(t("c.start"), act("start"), "sm"), btn(t("c.stop"), act("stop"), "sm"), btn(t("c.restart"), act("restart"), "sm"), btn(t("sc.logs"), toggleLogs, "sm"))),
-        h("div", { class: "grid g2" }, field(t("sc.token"), tok), field(t("sc.chat"), chat), field(t("sc.proxy"), proxy), field(t("sc.interval"), iv)),
-        h("label", { class: "chk" }, node, t("sc.node")),
-        h("div", { class: "row", style: "margin-top:8px" }, btn(t("c.save"), function () { save(false); }), btn(t("sc.saveRestart"), function () { save(true); }, "pri"),
-          btn(t("sc.test"), function () {
-            api("/telegram/test", { body: { instance: s.name, token: tok.value, chat: chat.value, proxy: proxy.value } }).then(function (r) { toast(r.message, !r.ok); }).catch(fail);
-          })));
+        h("div", { class: "row sb", style: "margin-bottom:12px" }, h("h2", { style: "margin:0" }, s.name, " ", h("span", { class: "pill " + (s.state === "active" ? "ok" : "bad") }, s.state === "active" ? t("st.active") : t("st.stopped")), " ", kindPill), controls),
+        managed && isSvc ? null : h("div", { class: "note", style: "margin-bottom:10px" }, t(s.legacy ? "sc.legacyNote" : "sc.oldNote"), " ",
+          btn(t("sc.convert"), function () { api("/schedulers/" + s.name + "/upgrade", { method: "POST" }).then(function () { toast(t("c.done")); load(); }).catch(fail); }, "sm pri")),
+        managed ? h("div", null,
+          h("div", { class: "grid g2" }, field(t("sc.token"), tok), field(t("sc.chat"), chat), field(t("sc.proxy"), proxy), field(t("sc.interval"), iv)),
+          h("label", { class: "chk" }, node, t("sc.node")),
+          h("div", { class: "row", style: "margin-top:8px" }, btn(t("c.save"), function () { save(false); }), btn(t("sc.saveRestart"), function () { save(true); }, "pri"),
+            btn(t("sc.test"), function () {
+              api("/telegram/test", { body: { instance: s.name, token: tok.value, chat: chat.value, proxy: proxy.value } }).then(function (r) { toast(r.message, !r.ok); }).catch(fail);
+            }))) : null);
       return el;
     }
     load(); every(10000, function () { if (!document.querySelector(".modal") && !document.querySelector("pre.log")) load(); });
@@ -307,89 +331,38 @@
     return page(t("nav.servers"), t("sv.sub"), box);
   }
 
-  /* ---------- migration wizard ---------- */
-  function migrate() {
-    var box = h("div"), M = { found: [], source: null, target: null, opts: { conflict: "skip", admin_mode: "map", group_mode: "by_source", group_name: "migrated", preserve_usage: true, create_missing_admins: true, auth_algorithm: "xxh128" }, step: 1, report: null };
-    var KINDS = { marzban: "Marzban", marzneshin: "Marzneshin", rebecca: "Rebecca", "3xui": "3x-ui / x-ui", pasarguard: "PasarGuard", marzban_t: "" };
-    function draw() {
-      clear(box);
-      box.appendChild(h("div", { class: "steps" }, [t("mg.s1"), t("mg.s2"), t("mg.s3"), t("mg.s4"), t("mg.s5")].map(function (label, i) { return h("b", { class: i + 1 === M.step ? "on" : "" }, label); })));
-      [null, s1, s2, s3, s4][M.step](box);
+  /* ---------- database engine conversion ---------- */
+  var ENGINES = { postgresql: "PostgreSQL", timescaledb: "TimescaleDB", mysql: "MySQL", mariadb: "MariaDB", sqlite: "SQLite" };
+  function convertPage() {
+    var box = h("div");
+    function load() {
+      api("/backups").then(function (d) {
+        clear(box);
+        var to = h("select", { class: "ltr" }, ["postgresql", "timescaledb", "mysql", "mariadb"].map(function (k) { return h("option", { value: k }, ENGINES[k]); }));
+        box.appendChild(h("div", { class: "card" },
+          h("div", { class: "note", style: "margin-bottom:14px" }, t("cv.safe")),
+          h("h2", null, t("cv.live")), h("p", { class: "sub" }, t("cv.liveHint")),
+          h("div", { class: "row" }, field(t("cv.target"), to),
+            btn(t("cv.liveBtn"), function () { api("/convert", { body: { source: "live", to: to.value } }).then(function (r) { openJob(r.job, load); }).catch(fail); }, "pri"))));
+        var rows = d.items.map(function (b) {
+          var cell = h("td", null, "…"), act = h("td", null);
+          api("/convert/" + encodeURIComponent(b.name)).then(function (i) {
+            cell.textContent = ENGINES[i.type] || "?";
+            (i.targets || []).forEach(function (k) {
+              act.appendChild(btn("→ " + ENGINES[k], function () { api("/convert", { body: { source: b.name, to: k } }).then(function (r) { openJob(r.job, load); }).catch(fail); }, "sm pri"));
+            });
+            if (!(i.targets || []).length) act.appendChild(h("span", { class: "sub" }, t("cv.none")));
+          }).catch(function () { cell.textContent = "?"; });
+          return h("tr", null, h("td", { class: "ltr mono" }, b.name), cell, h("td", null, h("div", { class: "row" }, act,
+            h("a", { class: "btn sm", href: BASE + "api/backups/" + encodeURIComponent(b.name) + "/download" }, t("bk.download")))));
+        });
+        box.appendChild(h("div", { class: "card tbl", style: "margin-top:14px" }, h("h2", null, t("cv.files")),
+          rows.length ? h("table", null, h("thead", null, h("tr", null, h("th", null, t("bk.file")), h("th", null, t("cv.engine")), h("th", null, ""))), h("tbody", null, rows)) : h("div", { class: "empty" }, t("bk.none")),
+          h("p", { class: "sub" }, t("cv.pairs"))));
+      }).catch(fail);
     }
-    function picker(title, current, onPick, allowKinds) {
-      var items = M.found.filter(function (f) { return allowKinds.indexOf(f.kind) >= 0; });
-      var kind = h("select", null, allowKinds.map(function (k) { return h("option", { value: k }, KINDS[k]); })), path = h("input", { type: "text", class: "ltr", placeholder: "/path/to/db.sqlite3" });
-      return h("div", null, h("h2", null, title),
-        items.length ? h("div", { class: "grid" }, items.map(function (f) {
-          var sel = current && current.kind === f.kind && current.path === f.path;
-          return h("div", { class: "card", style: "cursor:pointer;" + (sel ? "border-color:var(--ac)" : ""), tabindex: 0, onclick: function () { onPick({ kind: f.kind, dir: f.dir, path: f.path }); draw(); } },
-            h("strong", null, f.label), " ", h("span", { class: "pill" }, f.engine), h("div", { class: "ltr mono sub", style: "margin:4px 0 0" }, f.path || f.dir));
-        })) : h("div", { class: "note" }, t("mg.noneFound")),
-        h("div", { class: "card", style: "margin-top:12px" }, h("strong", null, t("mg.manual")), h("div", { class: "grid g2" }, field(t("mg.kind"), kind), field(t("mg.path"), path)),
-          btn(t("mg.useFile"), function () { if (!path.value) return; onPick({ kind: kind.value, path: path.value.trim() }); draw(); })));
-    }
-    function nav(back, next, nextText, nextOk) {
-      return h("div", { class: "row", style: "margin-top:16px" }, back ? btn(t("c.back"), function () { M.step--; draw(); }) : null, btn(nextText || t("c.next"), function () { if (nextOk === false) return toast(t("mg.pick"), true); next(); }, "pri"));
-    }
-    function s1(el) {
-      el.appendChild(picker(t("mg.srcTitle"), M.source, function (v) { M.source = v; }, ["marzban", "marzneshin", "rebecca", "3xui", "pasarguard"]));
-      if (M.source) el.appendChild(h("div", { class: "note", style: "margin-top:10px" }, t("mg.selected", { v: KINDS[M.source.kind] + " — " + (M.source.path || M.source.dir) })));
-      el.appendChild(nav(false, function () { M.step = 2; draw(); }, t("c.next"), !!M.source));
-    }
-    function s2(el) {
-      var tk = M.source.kind === "pasarguard" ? ["pasarguard", "marzban"] : ["pasarguard"];
-      el.appendChild(picker(t("mg.dstTitle"), M.target, function (v) { M.target = v; }, tk));
-      el.appendChild(h("div", { class: "note", style: "margin-top:10px" }, t("mg.dstNote")));
-      el.appendChild(nav(true, function () { M.step = 3; draw(); }, t("c.next"), !!M.target));
-    }
-    function sel(key, opts) { var s = h("select", { onchange: function () { M.opts[key] = s.value; } }, opts.map(function (o) { return h("option", { value: o[0] }, o[1]); })); s.value = M.opts[key]; return s; }
-    function s3(el) {
-      var o = M.opts, ta = h("input", { type: "text", class: "ltr", value: o.target_admin || "", onchange: function () { o.target_admin = this.value; } }),
-        gn = h("input", { type: "text", class: "ltr", value: o.group_name, onchange: function () { o.group_name = this.value; } }),
-        up = h("input", { type: "checkbox", onchange: function () { o.preserve_usage = this.checked; } }), ca = h("input", { type: "checkbox", onchange: function () { o.create_missing_admins = this.checked; } });
-      up.checked = o.preserve_usage; ca.checked = o.create_missing_admins;
-      el.appendChild(h("div", { class: "card" }, h("div", { class: "grid g2" },
-        field(t("mg.conflict"), sel("conflict", [["skip", t("mg.c.skip")], ["rename", t("mg.c.rename")], ["update", t("mg.c.update")]])),
-        field(t("mg.admins"), sel("admin_mode", [["map", t("mg.a.map")], ["single", t("mg.a.single")], ["none", t("mg.a.none")]])),
-        field(t("mg.targetAdmin"), ta),
-        field(t("mg.groups"), sel("group_mode", [["by_source", t("mg.g.by")], ["auto", t("mg.g.auto")], ["none", t("mg.g.none")]])),
-        field(t("mg.groupName"), gn),
-        M.source.kind === "marzneshin" ? field(t("mg.algo"), sel("auth_algorithm", [["xxh128", "xxh128"], ["plain", "plain"]])) : null),
-        h("label", { class: "chk" }, up, t("mg.keepUsage")), h("label", { class: "chk" }, ca, t("mg.createAdmins"))));
-      el.appendChild(nav(true, plan, t("mg.preview")));
-    }
-    function body() { return { source: M.source, target: M.target, options: M.opts }; }
-    function plan() {
-      var b = body(); toast(t("mg.analyzing"));
-      api("/migrate/plan", { body: b }).then(function (r) { M.report = r; M.step = 4; draw(); }).catch(fail);
-    }
-    function li(items) { return items.length ? h("ul", { style: "margin:6px 0;padding-inline-start:20px" }, items.slice(0, 12).map(function (x) { return h("li", null, typeof x === "string" ? x : x.join(" → ")); }), items.length > 12 ? h("li", null, t("mg.more", { n: nf(items.length - 12) })) : null) : null; }
-    function s4(el) {
-      var r = M.report, bad = r.errors.length > 0;
-      el.appendChild(h("div", { class: "grid g4" },
-        h("div", { class: "card stat" }, h("div", { class: "k" }, t("mg.srcUsers")), h("div", { class: "v" }, fa(r.source_users))),
-        h("div", { class: "card stat" }, h("div", { class: "k" }, t("mg.willAdd")), h("div", { class: "v", style: "color:var(--good)" }, fa(r.inserted))),
-        h("div", { class: "card stat" }, h("div", { class: "k" }, t("mg.willUpdate")), h("div", { class: "v" }, fa(r.updated))),
-        h("div", { class: "card stat" }, h("div", { class: "k" }, t("mg.skipped")), h("div", { class: "v", style: "color:var(--warn)" }, fa(r.skipped.length)))));
-      var det = h("div", { class: "card", style: "margin-top:14px" });
-      if (r.errors.length) det.appendChild(h("div", { class: "note warn" }, h("strong", null, t("mg.errors")), li(r.errors)));
-      if (r.warnings.length) det.appendChild(h("div", { class: "note", style: "margin-top:8px" }, h("strong", null, t("mg.warnings")), li(r.warnings)));
-      if (r.admins_created.length) det.appendChild(h("p", null, t("mg.newAdmins", { v: r.admins_created.join(", ") })));
-      if (r.groups_created.length) det.appendChild(h("p", null, t("mg.newGroups", { v: r.groups_created.join(", ") })));
-      if (r.renamed.length) det.appendChild(h("div", null, h("strong", null, t("mg.renames")), li(r.renamed)));
-      if (r.skipped.length) det.appendChild(h("div", null, h("strong", null, t("mg.skippedList")), li(r.skipped.map(function (s) { return s[0] + " (" + s[1] + ")"; }))));
-      el.appendChild(det);
-      var c = h("input", { type: "text", class: "ltr", placeholder: "MIGRATE" }), rs = h("input", { type: "checkbox" }); rs.checked = true;
-      el.appendChild(h("div", { class: "card", style: "margin-top:14px" }, h("div", { class: "note warn" }, t("mg.warnRun")),
-        h("label", { class: "chk" }, rs, t("mg.restartAfter")), field(t("mg.confirm"), c),
-        h("div", { class: "row" }, btn(t("c.back"), function () { M.step = 3; draw(); }),
-          h("button", { class: "btn pri", disabled: bad, type: "button", onclick: function () {
-            var b = body(); b.confirm = c.value.trim(); b.restart = rs.checked;
-            api("/migrate/apply", { body: b }).then(function (j) { openJob(j.job); }).catch(fail);
-          } }, t("mg.run")))));
-    }
-    api("/migrate/discover").then(function (d) { M.found = d.items; draw(); }).catch(function (e) { fail(e); draw(); });
-    return page(t("mg.title"), t("mg.sub"), box);
+    load();
+    return page(t("cv.title"), t("cv.sub"), box);
   }
 
   /* ---------- jobs ---------- */
@@ -449,7 +422,7 @@
     clear($app);
     if (!state.me) { $app.appendChild(loginView()); return; }
     var parts = (location.hash || "#/dashboard").slice(2).split("/"), name = parts[0] || "dashboard";
-    var views = { dashboard: dashboard, backups: backups, schedulers: schedulers, servers: servers, migrate: migrate, jobs: function () { return jobs(parts[1]); }, security: security };
+    var views = { dashboard: dashboard, backups: backups, schedulers: schedulers, servers: servers, convert: convertPage, jobs: function () { return jobs(parts[1]); }, security: security };
     if (!views[name]) name = "dashboard";
     $app.appendChild(shell(name, views[name]()));
   }
