@@ -3200,11 +3200,15 @@ def _transfer_to_server(zip_path, include_node, host, port, user, password=None,
         print_info("SSH host key is pinned; any other key will be rejected.")
     else:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        print_warning("SSH host key will be trusted on first connect (no verification). "
-                      "Pass the server's fingerprint (--host-fp / panel field) to prevent a man-in-the-middle.")
+        print_info("Trusting the server's SSH key on first connect (add a fingerprint in the panel to pin it).")
     try:
         _ssh_connect(ssh, host, port, user, password, key_text)
         print_success("Connected!")
+        try:
+            if ssh_shell(ssh, "id -u")[1] != "0":
+                print_warning(f"'{user}' is not root — installing packages and managing Docker may fail.")
+        except Exception:
+            pass
         print_info(f"Server host key: {_host_key_fingerprint(ssh.get_transport().get_remote_server_key())}")
         print()
 
@@ -3384,16 +3388,15 @@ def workflow_transfer():
     print()
     print(f"  {C.R1}{C.BOLD}--- New Server Information ---{C.RESET}")
     new_ip   = input(f"  {C.R2}> New Server IP: {C.RESET}").strip()
-    confirm  = input(f"  {C.R1}> User MUST be root. Confirm? (y/n): {C.RESET}").strip().lower()
-    if confirm != "y":
-        print_error("Root access required. Aborting.")
+    new_user = input(f"  {C.R2}> Username [root]: {C.RESET}").strip() or "root"
+    # getpass: the password isn't echoed to the terminal or left in scrollback.
+    new_pass = getpass.getpass(f"  {C.R2}> Password: {C.RESET}").strip()
+    if not new_ip or not new_pass:
+        print_error("IP and password are required.")
         return
-    # v4.2: use getpass so the root password isn't echoed to the terminal
-    # or left sitting in shell/screen scrollback.
-    new_pass = getpass.getpass(f"  {C.R2}> Root Password: {C.RESET}").strip()
 
     try:
-        _transfer_to_server(zip_path, include_node, new_ip, 22, "root", new_pass)
+        _transfer_to_server(zip_path, include_node, new_ip, 22, new_user, new_pass)
     finally:
         try:
             if os.path.exists(zip_path):
@@ -4092,7 +4095,7 @@ COMPONENT_DIR      = os.environ.get("PGB_ROOT", "/opt/pg-backup")
 # (vX.Y.Z), not from the moving `main` branch. Publish a tag for every release.
 # PGB_RAW_BASE overrides (tests, mirrors, a fork's main branch).
 COMPONENT_RAW_BASE = os.environ.get("PGB_RAW_BASE", "https://raw.githubusercontent.com/CIAUB/PG-Backup/v5.0.0")
-PGB_MANIFEST_SHA256 = "086077903c34ab8bd6ba835e7fa394c1344d5c9bd73de8a7adbf2e5e4acdfea2"
+PGB_MANIFEST_SHA256 = "fb2ffbac703b4b53292974f2126d1b7712a053e4f09ed51fd8e673cb36fd6895"
 PGB_VERSION = "5.0.0"
 
 def _fetch_bytes(url, timeout=40):
@@ -4347,8 +4350,8 @@ def run_cli(argv):
     if a.cmd == "transfer":
         if not a.yes:
             _cli_fail("transfer needs --yes (it replaces PasarGuard on the destination)")
-        if a.user != "root":
-            _cli_fail("the destination user must be root")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$", a.user):
+            _cli_fail("invalid SSH username")
         secret, auth = os.environ.get("PGB_SSH_SECRET", ""), os.environ.get("PGB_SSH_AUTH", "password")
         if not secret:
             _cli_fail("no SSH credential supplied (PGB_SSH_SECRET)")

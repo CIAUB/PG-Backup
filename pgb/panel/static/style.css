@@ -17,6 +17,8 @@
 @media(prefers-color-scheme:light){:root:not([data-theme]){--bg:#eef6f6;--bg2:rgba(255,255,255,.72);--card:rgba(255,255,255,.78);--card2:rgba(236,246,246,.8);--line:rgba(13,148,136,.18);--hl:rgba(255,255,255,.9);--tx:#0f2226;--mut:#56717a;--ac:#0d9488;--ac2:#0891b2;--acd:rgba(13,148,136,.12);--on-ac:#fff;--glow:rgba(13,148,136,.28);--tglow:transparent;--au1:rgba(13,148,136,.14);--au2:rgba(8,145,178,.10);--logbg:#0b1b1f;--inbg:rgba(255,255,255,.8);--shadow:0 10px 30px rgba(15,60,70,.10);color-scheme:light}}
 /* ---- pure black (OLED, white neon) ---- */
 :root[data-theme=black],.tp[data-theme=black]{--bg:#000;--bg2:rgba(8,8,8,.78);--card:rgba(255,255,255,.045);--card2:rgba(255,255,255,.07);--line:rgba(255,255,255,.14);--hl:rgba(255,255,255,.08);--tx:#fff;--mut:#9b9b9b;--ac:#fff;--ac2:#cfcfcf;--acd:rgba(255,255,255,.12);--on-ac:#000;--glow:rgba(255,255,255,.35);--tglow:rgba(255,255,255,.28);--au1:rgba(255,255,255,.07);--au2:rgba(255,255,255,.03);--logbg:#050505;--inbg:rgba(255,255,255,.05);--shadow:0 10px 40px rgba(0,0,0,.6);color-scheme:dark}
+/* ---- absolute black: #000 everywhere, no aurora, no glow (OLED, max battery saving) ---- */
+:root[data-theme=amoled],.tp[data-theme=amoled]{--bg:#000;--bg2:#000;--card:#000;--card2:#0d0d0d;--line:rgba(255,255,255,.16);--hl:transparent;--tx:#fff;--mut:#9a9a9a;--ac:#fff;--ac2:#d4d4d4;--acd:rgba(255,255,255,.10);--on-ac:#000;--glow:transparent;--tglow:transparent;--au1:transparent;--au2:transparent;--logbg:#000;--inbg:#000;--shadow:none;color-scheme:dark}
 /* ---- pure white ---- */
 :root[data-theme=white],.tp[data-theme=white]{--bg:#fff;--bg2:rgba(250,250,250,.8);--card:rgba(255,255,255,.9);--card2:rgba(245,245,245,.9);--line:rgba(0,0,0,.11);--hl:#fff;--tx:#0a0a0a;--mut:#626262;--ac:#0a0a0a;--ac2:#3a3a3a;--acd:rgba(0,0,0,.07);--on-ac:#fff;--glow:rgba(0,0,0,.18);--tglow:transparent;--au1:rgba(0,0,0,.035);--au2:rgba(0,0,0,.02);--logbg:#0a0a0a;--inbg:#fff;--shadow:0 8px 30px rgba(0,0,0,.08);color-scheme:light}
 /* ---- black + red neon ---- */
@@ -198,3 +200,7 @@ code,.mono{font-feature-settings:normal}
   .tp .pv{height:64px}
   .pick{padding-bottom:max(18px,env(safe-area-inset-bottom))}
 }
+
+.logo{display:inline-flex;line-height:0}.logo svg{filter:drop-shadow(0 0 9px var(--glow));transition:filter .3s var(--ease),transform .4s var(--ease)}
+.brand:hover .logo svg{transform:rotate(-6deg) scale(1.06)}
+.brand.tb{padding:0;font-size:17px}.brand.tb .logo svg{width:26px;height:26px}

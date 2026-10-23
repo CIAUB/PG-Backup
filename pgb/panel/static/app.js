@@ -61,7 +61,7 @@
   /* themes: "system" follows the OS (teal dark/light); every other id is a fixed palette defined in style.css */
   var THEMES = [
     ["system", "#0a1113", "#eef6f6"], ["dark", "#0a1113", "#2dd4bf"], ["light", "#eef6f6", "#0d9488"],
-    ["black", "#000000", "#ffffff"], ["white", "#ffffff", "#0a0a0a"], ["blackred", "#050001", "#ff2d3d"],
+    ["black", "#000000", "#ffffff"], ["amoled", "#000000", "#ffffff"], ["white", "#ffffff", "#0a0a0a"], ["blackred", "#050001", "#ff2d3d"],
     ["whitered", "#fffafa", "#e11d2e"], ["cyber", "#06041a", "#00f0ff"], ["emerald", "#03110a", "#34f5a0"],
     ["ocean", "#020a1b", "#38bdf8"], ["sunset", "#130706", "#ff8a3d"], ["aurora", "#0a0716", "#a78bfa"]
   ];
@@ -75,9 +75,17 @@
     if (v === "system") root.removeAttribute("data-theme"); else root.setAttribute("data-theme", v);
     var row = THEMES.filter(function (x) { return x[0] === v; })[0], dark = window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches;
     var bg = v === "system" ? (dark ? "#0a1113" : "#eef6f6") : row[1];
+    var fc = v === "system" ? (dark ? ["#0e1a1c", "#2dd4bf", "#22d3ee"] : ["#eef6f6", "#0d9488", "#0891b2"]) : [row[1], row[2], row[2]];
+    if (v === "cyber") fc[2] = "#ff2bd6";
+    var ic = document.querySelector("link[rel=icon]");
+    if (ic) ic.setAttribute("href", "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="' + fc[0] + '"/><path d="M16 6c5.500 0 9 2 9 4.500S21.500 15 16 15 7 13 7 10.500 10.500 6 16 6z" fill="none" stroke="' + fc[1] + '" stroke-width="2" stroke-linecap="round"/><path d="M7 13c0 2.500 3.500 4.500 9 4.500s9-2 9-4.500m-18 6.500C7 22 10.500 24 16 24s9-2 9-4.500" fill="none" stroke="' + fc[2] + '" stroke-width="2" stroke-linecap="round"/></svg>'));
     Array.prototype.forEach.call(document.querySelectorAll("meta[name=theme-color]"), function (m, i) { m.setAttribute("content", bg); m.removeAttribute("media"); if (i) m.remove(); });
   }
   applyTheme(themePref());
+  /* brand logo: inline SVG painted with the active theme tokens, so it follows every theme */
+  function logo(size) {
+    return h("span", { class: "logo", html: '<svg viewBox="0 0 32 32" width="' + size + '" height="' + size + '" aria-hidden="true"><rect width="32" height="32" rx="8" style="fill:var(--card2);stroke:var(--ac);stroke-opacity:.45;stroke-width:1"/><path d="M16 6c5.500 0 9 2 9 4.500S21.500 15 16 15 7 13 7 10.500 10.500 6 16 6z" fill="none" style="stroke:var(--ac)" stroke-width="2" stroke-linecap="round"/><path d="M7 13c0 2.500 3.500 4.500 9 4.500s9-2 9-4.500m-18 6.500C7 22 10.500 24 16 24s9-2 9-4.500" fill="none" style="stroke:var(--ac2)" stroke-width="2" stroke-linecap="round"/></svg>' }).firstChild;
+  }
   var PAL = "M12 3a9 9 0 1 0 0 18c1.100 0 1.800-.8 1.800-1.700 0-.5-.2-.9-.5-1.300-.3-.4-.5-.8-.5-1.300 0-1 .8-1.700 1.700-1.700H16a5 5 0 0 0 5-5c0-4.400-4-7-9-7zM7.500 11h.01M10 7.500h.01M14.500 7.500h.01";
   function palIcon() { return h("span", { html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="' + PAL + '"/></svg>' }).firstChild; }
   function themeBtn(cls) {
@@ -144,7 +152,7 @@
   ];
   function shell(active, content) {
     var side = h("aside", { class: "side", id: "side" },
-      h("div", { class: "brand" }, h("img", { src: "static/favicon.svg", width: 30, height: 30, alt: "" }), "PG-Backup", themeBtn()),
+      h("div", { class: "brand" }, logo(30), "PG-Backup", themeBtn()),
       h("nav", { class: "nav" }, PAGES.map(function (p) {
         return h("a", { href: "#/" + p[0], class: p[0] === active ? "on" : "", onclick: function () { side.classList.remove("open"); } }, icon(p[2]), t(p[1]));
       })),
@@ -153,7 +161,7 @@
       h("div", { class: "row", style: "padding:8px" }, h("span", { class: "pill" }, state.me.user),
         btn(t("c.logout"), function () { api("/logout", { method: "POST" }).then(function () { state.me = null; route(); }); }, "sm")));
     return h("div", { class: "shell" }, side, h("div", { class: "scrim", onclick: function () { side.classList.remove("open"); } }), h("div", null,
-      h("div", { class: "top" }, h("strong", null, "PG-Backup"), h("div", { class: "tools" }, themeBtn(), btn("☰", function () { side.classList.toggle("open"); }, "sm"))),
+      h("div", { class: "top" }, h("strong", { class: "brand tb" }, logo(26), "PG-Backup"), h("div", { class: "tools" }, themeBtn(), btn("☰", function () { side.classList.toggle("open"); }, "sm"))),
       h("main", { class: "main" }, content)));
   }
   function page(title, sub, children) { return [h("h1", null, title), h("p", { class: "sub" }, sub || ""), children]; }
@@ -174,7 +182,7 @@
         err.style.display = "";
       });
     } }, field(t("login.user"), u), field(t("login.pass"), p), otpBox, err, h("button", { class: "btn pri", style: "width:100%;justify-content:center;margin-top:8px" }, t("login.submit")));
-    return h("div", { class: "login" }, h("div", { class: "card" }, h("div", { class: "brand" }, h("img", { src: "static/favicon.svg", width: 34, height: 34, alt: "" }), "PG-Backup"),
+    return h("div", { class: "login" }, h("div", { class: "card" }, h("div", { class: "brand" }, logo(34), "PG-Backup"),
       h("p", { class: "sub", style: "text-align:center" }, t("login.sub")), f), themeBtn("floatpal"));
   }
 

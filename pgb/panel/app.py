@@ -808,8 +808,8 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
         name = str(d.get("name") or host).strip()[:60]
         if not re.match(r"^[A-Za-z0-9_.:][A-Za-z0-9_.:-]{0,254}$", host):
             return jerr("invalid host")
-        if user != "root":
-            return jerr("transfer needs the root user on the destination server")
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$", user):
+            return jerr("invalid SSH username")
         try:
             port = int(d.get("port") or 22)
         except (TypeError, ValueError):
