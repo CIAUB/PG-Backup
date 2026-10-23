@@ -1,7 +1,7 @@
 {
  "files": {
   "pgb/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "pgb/dbconv.py": "72373b17cd8ce77e15c38ba9ca403aae46c8278a43d7dd64181df29a9d9fb246",
+  "pgb/dbconv.py": "98bbfda3a671ae5fd20702306239c6a072f68632df9beac48d3a0e913c8ed5cf",
   "pgb/installer.py": "a9a311ef3678217a94e9dbec97bd56223cd0318c1b1f9a93dc65d414079779e2",
   "pgb/panel/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "pgb/panel/__main__.py": "09fb83b6b818daf349693b3ae039c457d3f2b56df74aa4f7a33ce6371c72ce9d",

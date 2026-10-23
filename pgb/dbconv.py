@@ -124,6 +124,8 @@ def _mentions_timescale(stmt: str) -> bool:
     String literals and comments are ignored (user data / notes may legitimately say
     "timescaledb"); dollar-quoted function bodies are checked separately for real calls.
     """
+    if "_timescaledb" in _LINE_CMT.sub("", stmt):
+        return True                                  # internal schemas, even inside setval('…') strings
     bodies = [m.group(2) for m in _BODY.finditer(stmt)]
     code = _BODY.sub(" ", stmt)
     code = _STR.sub("''", _LINE_CMT.sub("", code))
@@ -206,6 +208,9 @@ def pg_timescale_to_plain(src: Iterable[str], dst, rep: Report) -> None:
         if not sc.pending():
             stripped = line.strip()
             if not stripped:
+                dst.write(line)
+                continue
+            if stripped.startswith("\\"):                  # psql meta-command (\restrict / \unrestrict …)
                 dst.write(line)
                 continue
             if stripped.startswith("--"):
@@ -531,7 +536,7 @@ def verify_output(path: str, target: str) -> List[str]:
                                 continue
                             if ln.startswith("COPY ") and ln.rstrip().endswith("FROM stdin;"):
                                 in_copy = True
-                            if "timescaledb" in ln.lower() and not ln.lstrip().startswith("--"):
+                            if not ln.lstrip().startswith(("--", "\\")) and _mentions_timescale(ln):
                                 problems.append(f"{n}: timescaledb reference left: {ln.strip()[:80]}")
                                 break
     return problems
