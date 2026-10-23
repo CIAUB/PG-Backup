@@ -163,10 +163,19 @@ install -m 0755 -o root -g root -- "${SRC}" "${NEW}"
 mv -f -- "${NEW}" "${INSTALL_PATH}"
 ok "Installed to ${INSTALL_PATH}"
 
+# Lower-case alias so both `PG-Backup` and `pg-backup` work. Only (re)create it when
+# it is absent or already one of ours; never overwrite an unrelated file.
+ALIAS_PATH="$(dirname "${INSTALL_PATH}")/pg-backup"
+if [ ! -e "${ALIAS_PATH}" ] || [ "$(readlink -- "${ALIAS_PATH}" 2>/dev/null)" = "${INSTALL_PATH}" ]; then
+  ln -sfn -- "${INSTALL_PATH}" "${ALIAS_PATH}" && ok "Alias: pg-backup -> PG-Backup"
+else
+  warn "${ALIAS_PATH} already exists and is not ours; alias not created."
+fi
+
 if [ -t 0 ] && [ -t 1 ]; then
   info "Launching PG-Backup…"
   echo
   rm -rf -- "${WORK}"; trap - EXIT      # exec replaces the shell, so clean up first
   exec "${INSTALL_PATH}"
 fi
-info "Run it with:  sudo PG-Backup"
+info "Run it with:  sudo PG-Backup   (or: sudo pg-backup)"
