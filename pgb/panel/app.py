@@ -26,6 +26,7 @@ from .store import Store
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 COOKIE = "pgb_s"
 SESSION_TTL = 8 * 3600
+PANEL_VERSION = "5.0.0"
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 BACKUP_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}\.zip$")
 UNIT_BASE = "pasarguard-backup"
@@ -162,6 +163,18 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
             store.set("admin", admin)
         return s_
 
+    def _build_id() -> str:
+        import hashlib
+        h_ = hashlib.sha256()
+        for f_ in (os.path.abspath(__file__), os.path.join(STATIC_DIR, "app.js"), os.path.join(STATIC_DIR, "style.css")):
+            try:
+                with open(f_, "rb") as fh:
+                    h_.update(fh.read())
+            except OSError:
+                pass
+        return h_.hexdigest()[:7]
+    BUILD_ID = _build_id()
+
     def run_cli(*args: str) -> List[str]:
         return list(cfg.cli) + ["--cli"] + list(args)
 
@@ -225,7 +238,7 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
     async def me(req: Request):
         a = store.get("admin")
         return JSONResponse({"user": a["username"], "totp": bool(a.get("totp")),
-                             "recovery_left": len(a.get("recovery", []))})
+                             "recovery_left": len(a.get("recovery", [])), "version": PANEL_VERSION, "build": BUILD_ID})
 
     @guarded
     async def change_password(req: Request):
@@ -952,7 +965,9 @@ def create_app(cfg: Optional[Config] = None) -> Starlette:
         full = os.path.realpath(os.path.join(STATIC_DIR, rel))
         if not full.startswith(os.path.realpath(STATIC_DIR) + os.sep) or not os.path.isfile(full):
             return PlainTextResponse("not found", 404)
-        return FileResponse(full, headers={"Cache-Control": "public, max-age=3600", "X-Content-Type-Options": "nosniff"})
+        # fonts never change; code/styles must revalidate (ETag) so an updated panel is never shown stale
+        cache = "public, max-age=604800, immutable" if "/fonts/" in full.replace(os.sep, "/") else "no-cache"
+        return FileResponse(full, headers={"Cache-Control": cache, "X-Content-Type-Options": "nosniff"})
 
     api = [
         Route("/login", login, methods=["POST"]), Route("/logout", logout, methods=["POST"]),

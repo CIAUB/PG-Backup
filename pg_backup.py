@@ -4092,12 +4092,33 @@ COMPONENT_DIR      = os.environ.get("PGB_ROOT", "/opt/pg-backup")
 # (vX.Y.Z), not from the moving `main` branch. Publish a tag for every release.
 # PGB_RAW_BASE overrides (tests, mirrors, a fork's main branch).
 COMPONENT_RAW_BASE = os.environ.get("PGB_RAW_BASE", "https://raw.githubusercontent.com/CIAUB/PG-Backup/v5.0.0")
-PGB_MANIFEST_SHA256 = "edfe516970da7b1e0bfad72da5066cc0cd9cd1a5caae60d50a2c16151c0a3abb"
+PGB_MANIFEST_SHA256 = "44cb3aeb59172cd8b96d3ae253b24d9b9e99bda589f659c7b867c19f39713fac"
 PGB_VERSION = "5.0.0"
 
 def _fetch_bytes(url, timeout=40):
     with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout) as r:
         return r.read()
+
+def _restart_panel_if_running():
+    """A running web panel keeps the OLD code in memory: restart it after its files were replaced."""
+    try:
+        if shutil.which("systemctl") and subprocess.run(
+                ["systemctl", "is-active", "--quiet", "pg-backup-panel"], timeout=15).returncode == 0:
+            subprocess.run(["systemctl", "restart", "pg-backup-panel"], timeout=60, check=False)
+            print_success("Web panel restarted — reload the page (Ctrl+F5) to see the new version.")
+    except Exception as e:
+        print_warning(f"Could not restart the web panel automatically: {e}")
+
+def _refresh_components_if_stale():
+    """After an update, bring an already-installed panel/components up to date (silent when offline)."""
+    try:
+        mf = os.path.join(COMPONENT_DIR, "pgb-manifest.json")
+        if os.path.exists(mf) and set(PGB_MANIFEST_SHA256) != {"0"}:
+            with open(mf, "rb") as f:
+                if hashlib.sha256(f.read()).hexdigest() != PGB_MANIFEST_SHA256:
+                    _ensure_components()
+    except Exception:
+        pass
 
 def _ensure_components(force=False):
     """Download/verify the pgb package into COMPONENT_DIR. Returns True when ready."""
@@ -4160,6 +4181,7 @@ def _ensure_components(force=False):
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
         print_success(f"Components installed in {COMPONENT_DIR} ({len(staged)} files)")
+        _restart_panel_if_running()
         return True
     except Exception as e:
         print_error(f"Could not install components: {e}")
@@ -4372,6 +4394,7 @@ MENU = [
 ]
 
 def main():
+    _refresh_components_if_stale()
     while True:
         print_header()
 

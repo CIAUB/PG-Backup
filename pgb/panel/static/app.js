@@ -85,7 +85,9 @@
     var m = h("div", { class: "modal", role: "dialog", "aria-modal": "true", "aria-label": title,
       onclick: function (e) { if (e.target === m) close(); } },
       h("div", { class: "card" }, h("h2", null, title), body, h("div", { class: "row", style: "margin-top:14px;justify-content:flex-end" }, actions(close))));
-    function close() { m.remove(); }
+    function onKey(e) { if (e.key === "Escape") close(); }
+    function close() { m.remove(); document.removeEventListener("keydown", onKey); }
+    document.addEventListener("keydown", onKey);
     document.body.appendChild(m);
     var first = m.querySelector("input,select,button"); if (first) first.focus();
     return close;
@@ -116,9 +118,10 @@
       })),
       h("div", { class: "sp" }),
       prefs(),
+      h("div", { class: "sub ltr mono", style: "margin:0;padding:0 10px;font-size:11px" }, "v" + (state.me.version || "") + " · " + (state.me.build || "")),
       h("div", { class: "row", style: "padding:8px" }, h("span", { class: "pill" }, state.me.user),
         btn(t("c.logout"), function () { api("/logout", { method: "POST" }).then(function () { state.me = null; route(); }); }, "sm")));
-    return h("div", { class: "shell" }, side, h("div", null,
+    return h("div", { class: "shell" }, side, h("div", { class: "scrim", onclick: function () { side.classList.remove("open"); } }), h("div", null,
       h("div", { class: "top" }, h("strong", null, "PG-Backup"), btn("☰", function () { side.classList.toggle("open"); }, "sm")),
       h("main", { class: "main" }, content)));
   }
@@ -243,12 +246,12 @@
         tok = h("input", { type: "password", class: "ltr", placeholder: "123456789:AA…", autocomplete: "off" }),
         chat = h("input", { type: "text", class: "ltr", placeholder: "123456789 / -100… / @channel" }),
         proxy = h("input", { type: "text", class: "ltr", placeholder: t("sc.proxyPh") }),
-        iv = h("input", { type: "number", step: "0.25", min: "0.05", value: 1 }), node = h("input", { type: "checkbox" });
+        iv = h("input", { type: "number", step: "0.25", min: "0.05", value: 1 }), node = h("input", { type: "checkbox" }), skip = h("input", { type: "checkbox" });
       modal(t("sc.new"), h("div", null, h("p", { class: "note" }, t("sc.newHint")),
         h("div", { class: "grid g2" }, field(t("sc.token"), tok), field(t("sc.chat"), chat), field(t("sc.interval"), iv), field(t("sc.name"), name)),
-        field(t("sc.proxy"), proxy), h("label", { class: "chk" }, node, t("sc.node"))), function (c) {
+        field(t("sc.proxy"), proxy), h("label", { class: "chk" }, node, t("sc.node")), h("label", { class: "chk" }, skip, t("sc.skipTest"))), function (c) {
         return [btn(t("c.cancel"), c), btn(t("sc.create"), function () {
-          api("/schedulers/create", { body: { name: name.value, token: tok.value, chat: chat.value, proxy: proxy.value, interval: iv.value, node: node.checked } })
+          api("/schedulers/create", { body: { name: name.value, token: tok.value, chat: chat.value, proxy: proxy.value, interval: iv.value, node: node.checked, test: !skip.checked } })
             .then(function () { c(); toast(t("sc.created")); load(); }).catch(fail);
         }, "pri")];
       });
@@ -426,6 +429,18 @@
     if (!views[name]) name = "dashboard";
     $app.appendChild(shell(name, views[name]()));
   }
+  /* label table cells so rows can be shown as stacked cards on phones */
+  function labelTables() {
+    var tabs = $app.querySelectorAll("table:not([data-lab])");
+    Array.prototype.forEach.call(tabs, function (tb) {
+      var heads = Array.prototype.map.call(tb.querySelectorAll("thead th"), function (x) { return x.textContent.trim(); });
+      Array.prototype.forEach.call(tb.querySelectorAll("tbody tr"), function (tr) {
+        Array.prototype.forEach.call(tr.children, function (td, i) { td.setAttribute("data-l", heads[i] || ""); });
+      });
+      tb.setAttribute("data-lab", "1");
+    });
+  }
+  if (window.MutationObserver) new MutationObserver(labelTables).observe($app, { childList: true, subtree: true });
   window.addEventListener("hashchange", route);
   api("/me").then(function (m) { state.me = m; route(); }).catch(function () { state.me = null; route(); });
 })();
