@@ -4092,7 +4092,7 @@ COMPONENT_DIR      = os.environ.get("PGB_ROOT", "/opt/pg-backup")
 # (vX.Y.Z), not from the moving `main` branch. Publish a tag for every release.
 # PGB_RAW_BASE overrides (tests, mirrors, a fork's main branch).
 COMPONENT_RAW_BASE = os.environ.get("PGB_RAW_BASE", "https://raw.githubusercontent.com/CIAUB/PG-Backup/v5.0.0")
-PGB_MANIFEST_SHA256 = "44cb3aeb59172cd8b96d3ae253b24d9b9e99bda589f659c7b867c19f39713fac"
+PGB_MANIFEST_SHA256 = "0fa2b0d83c92a2e8222d784038f0e0b7f94481f3076a52b8c81b0bac0e01f094"
 PGB_VERSION = "5.0.0"
 
 def _fetch_bytes(url, timeout=40):

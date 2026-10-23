@@ -58,26 +58,36 @@
   function dt(ts) { return ts ? new Date(ts * 1000).toLocaleString(I18N.locale()) : "—"; }
   var fa = nf;
   function uptime(sec) { return sec >= 86400 ? t("u.days", { n: nf(Math.floor(sec / 86400)) }) : sec >= 3600 ? t("u.hours", { n: nf(Math.floor(sec / 3600)) }) : t("u.minutes", { n: nf(Math.max(1, Math.floor(sec / 60))) }); }
-  /* theme: follows the system until the user picks something */
-  function themePref() { try { return localStorage.getItem("pgb_theme") || "system"; } catch (e) { return "system"; } }
+  /* themes: "system" follows the OS (teal dark/light); every other id is a fixed palette defined in style.css */
+  var THEMES = [
+    ["system", "#0a1113", "#eef6f6"], ["dark", "#0a1113", "#2dd4bf"], ["light", "#eef6f6", "#0d9488"],
+    ["black", "#000000", "#ffffff"], ["white", "#ffffff", "#0a0a0a"], ["blackred", "#050001", "#ff2d3d"],
+    ["whitered", "#fffafa", "#e11d2e"], ["cyber", "#06041a", "#00f0ff"], ["emerald", "#03110a", "#34f5a0"],
+    ["ocean", "#020a1b", "#38bdf8"], ["sunset", "#130706", "#ff8a3d"], ["aurora", "#0a0716", "#a78bfa"]
+  ];
+  function themePref() {
+    var v = "system"; try { v = localStorage.getItem("pgb_theme") || "system"; } catch (e) { }
+    return THEMES.some(function (x) { return x[0] === v; }) ? v : "system";
+  }
   function applyTheme(v) {
     try { if (v === "system") localStorage.removeItem("pgb_theme"); else localStorage.setItem("pgb_theme", v); } catch (e) { }
-    if (v === "light" || v === "dark") document.documentElement.setAttribute("data-theme", v); else document.documentElement.removeAttribute("data-theme");
+    var root = document.documentElement;
+    if (v === "system") root.removeAttribute("data-theme"); else root.setAttribute("data-theme", v);
+    var row = THEMES.filter(function (x) { return x[0] === v; })[0], dark = window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches;
+    var bg = v === "system" ? (dark ? "#0a1113" : "#eef6f6") : row[1];
+    Array.prototype.forEach.call(document.querySelectorAll("meta[name=theme-color]"), function (m, i) { m.setAttribute("content", bg); m.removeAttribute("media"); if (i) m.remove(); });
   }
   applyTheme(themePref());
   function prefs() {
     var th = themePref();
-    var themeSel = h("div", { class: "seg", role: "group", "aria-label": t("c.theme") }, ["system", "light", "dark"].map(function (v) {
-      return h("button", { type: "button", class: v === th ? "on" : "", "aria-pressed": v === th ? "true" : "false", title: t("th." + v), onclick: function () { applyTheme(v); route(); } }, themeIcon(v));
+    var themeSel = h("div", { class: "themes", role: "group", "aria-label": t("c.theme") }, THEMES.map(function (x) {
+      var grad = x[0] === "cyber" ? "linear-gradient(135deg," + x[1] + " 45%,#ff2bd6 45% 62%," + x[2] + " 62%)" : "linear-gradient(135deg," + x[1] + " 50%," + x[2] + " 50%)";
+      return h("button", { type: "button", class: x[0] === th ? "on" : "", "aria-pressed": x[0] === th ? "true" : "false", "aria-label": t("th." + x[0]), title: t("th." + x[0]), style: "background:" + grad, onclick: function () { applyTheme(x[0]); route(); } });
     }));
     var langSel = h("div", { class: "seg", role: "group", "aria-label": t("c.language") }, I18N.langs.map(function (l) {
       return h("button", { type: "button", class: l === I18N.get() ? "on" : "", "aria-pressed": l === I18N.get() ? "true" : "false", lang: l, title: I18N.name(l), onclick: function () { I18N.set(l); route(); } }, l.toUpperCase());
     }));
-    return h("div", { class: "prefs" }, langSel, themeSel);
-  }
-  function themeIcon(v) {
-    var p = { system: "M4 5h16v11H4zM9 20h6M12 16v4", light: "M12 4V2m0 20v-2m8-8h2M2 12h2m13.7-5.7 1.4-1.4M4.9 19.1l1.4-1.4m0-11.4L4.9 4.900m14.200 14.200-1.400-1.400M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", dark: "M20 14.500A8 8 0 0 1 9.500 4 8 8 0 1 0 20 14.500z" }[v];
-    return h("span", { html: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="' + p + '"/></svg>' }).firstChild;
+    return h("div", { class: "prefs" }, langSel, themeSel, h("div", { class: "thname" }, t("th." + th)));
   }
   function clearTimers() { state.timers.forEach(clearInterval); state.timers = []; if (state.es) { state.es.close(); state.es = null; } }
   function every(ms, fn) { state.timers.push(setInterval(fn, ms)); }

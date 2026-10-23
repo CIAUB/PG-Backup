@@ -8,6 +8,7 @@
 - Panel: JSON body cap, session revocation on logout, encrypted TOTP secret, constant-time username compare, security headers + no-store, Telegram/proxy validation.
 - Panel: schedulers made by the terminal menu / pre-4.2 versions / screen / tmux are now listed (the panel built the wrong unit name `pasarguard-backup-pasarguard-backup-1`), with a “Convert to service” action.
 - NEW database-engine conversion (menu 7, `--cli convert`, panel page): TimescaleDB ⇄ PostgreSQL and MariaDB ⇄ MySQL. Reads a backup zip (or a fresh read-only backup of this server) and writes a NEW converted zip; never restores and never touches the running server. Cross-family conversion (SQLite/PostgreSQL/MySQL) is deliberately not offered.
+- Panel redesign: glass cards, soft neon glow, smooth animations (respect reduced-motion) and 12 themes — system, dark/light teal, pure black, pure white, black+red, white+red, cyber neon, emerald, ocean, sunset, aurora — picked from swatches in the sidebar.
 - Panel: fully responsive (phones 320px+ and desktop): drawer menu with scrim, tables become cards, dialogs become bottom sheets, 44px touch targets, no iOS zoom, safe-area insets, Esc closes dialogs. Version/build shown in the sidebar.
 - Panel freshness: updating PG-Backup now restarts a running web panel automatically, and the panel's JS/CSS are revalidated (ETag) instead of cached for an hour — the old UI could keep showing after an update.
 - Panel: optional “skip Telegram test” when creating a scheduler (Telegram may be unreachable from the server).
