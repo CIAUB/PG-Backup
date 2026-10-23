@@ -78,16 +78,38 @@
     Array.prototype.forEach.call(document.querySelectorAll("meta[name=theme-color]"), function (m, i) { m.setAttribute("content", bg); m.removeAttribute("media"); if (i) m.remove(); });
   }
   applyTheme(themePref());
-  function prefs() {
-    var th = themePref();
-    var themeSel = h("div", { class: "themes", role: "group", "aria-label": t("c.theme") }, THEMES.map(function (x) {
-      var grad = x[0] === "cyber" ? "linear-gradient(135deg," + x[1] + " 45%,#ff2bd6 45% 62%," + x[2] + " 62%)" : "linear-gradient(135deg," + x[1] + " 50%," + x[2] + " 50%)";
-      return h("button", { type: "button", class: x[0] === th ? "on" : "", "aria-pressed": x[0] === th ? "true" : "false", "aria-label": t("th." + x[0]), title: t("th." + x[0]), style: "background:" + grad, onclick: function () { applyTheme(x[0]); route(); } });
-    }));
+  var PAL = "M12 3a9 9 0 1 0 0 18c1.100 0 1.800-.8 1.800-1.700 0-.5-.2-.9-.5-1.300-.3-.4-.5-.8-.5-1.300 0-1 .8-1.700 1.700-1.700H16a5 5 0 0 0 5-5c0-4.400-4-7-9-7zM7.500 11h.01M10 7.500h.01M14.500 7.500h.01";
+  function palIcon() { return h("span", { html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="' + PAL + '"/></svg>' }).firstChild; }
+  function themeBtn(cls) {
+    return h("button", { type: "button", class: "iconbtn " + (cls || ""), "aria-label": t("c.theme"), title: t("c.theme"), onclick: openPicker }, palIcon());
+  }
+  /* theme + language picker: live preview tiles (each tile is rendered with its own theme tokens) */
+  function openPicker() {
+    var th = themePref(), tiles = [];
+    function mark(id) { tiles.forEach(function (x) { var on = x.id === id; x.el.classList.toggle("on", on); x.el.setAttribute("aria-pressed", on ? "true" : "false"); }); }
+    THEMES.forEach(function (x, i) {
+      var id = x[0], el;
+      var pv = id === "system"
+        ? h("span", { class: "pv" }, h("div", { "data-theme": "dark", class: "tp-h" }, h("em"), h("span")), h("div", { "data-theme": "light", class: "tp-h" }, h("em"), h("span")))
+        : h("span", { class: "pv" }, h("i"), h("b", null, h("em"), h("span")));
+      el = h("button", { type: "button", class: "tp" + (id === "system" ? " sys" : "") + (id === th ? " on" : ""), "data-theme": id === "system" ? "dark" : id,
+        "aria-pressed": id === th ? "true" : "false", style: "animation-delay:" + (i * 30) + "ms",
+        onclick: function () { applyTheme(id); mark(id); } }, pv, h("span", { class: "nm" }, t("th." + id)), h("span", { class: "ck", "aria-hidden": "true" }, "✓"));
+      tiles.push({ id: id, el: el });
+    });
     var langSel = h("div", { class: "seg", role: "group", "aria-label": t("c.language") }, I18N.langs.map(function (l) {
-      return h("button", { type: "button", class: l === I18N.get() ? "on" : "", "aria-pressed": l === I18N.get() ? "true" : "false", lang: l, title: I18N.name(l), onclick: function () { I18N.set(l); route(); } }, l.toUpperCase());
+      return h("button", { type: "button", class: l === I18N.get() ? "on" : "", "aria-pressed": l === I18N.get() ? "true" : "false", lang: l, onclick: function () { I18N.set(l); closeP(); route(); } }, I18N.name(l));
     }));
-    return h("div", { class: "prefs" }, langSel, themeSel, h("div", { class: "thname" }, t("th." + th)));
+    var m = h("div", { class: "modal", role: "dialog", "aria-modal": "true", "aria-label": t("c.theme"), onclick: function (e) { if (e.target === m) closeP(); } },
+      h("div", { class: "card pick" },
+        h("h2", null, t("c.theme"), h("button", { type: "button", class: "x", "aria-label": "close", onclick: function () { closeP(); } }, "×")),
+        h("div", { class: "tgrid" }, tiles.map(function (x) { return x.el; })),
+        h("div", { class: "lbl" }, t("c.language")), langSel));
+    function onKey(e) { if (e.key === "Escape") closeP(); }
+    function closeP() { m.remove(); document.removeEventListener("keydown", onKey); }
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(m);
+    var on = m.querySelector(".tp.on"); if (on) on.focus();
   }
   function clearTimers() { state.timers.forEach(clearInterval); state.timers = []; if (state.es) { state.es.close(); state.es = null; } }
   function every(ms, fn) { state.timers.push(setInterval(fn, ms)); }
@@ -122,17 +144,16 @@
   ];
   function shell(active, content) {
     var side = h("aside", { class: "side", id: "side" },
-      h("div", { class: "brand" }, h("img", { src: "static/favicon.svg", width: 30, height: 30, alt: "" }), "PG-Backup"),
+      h("div", { class: "brand" }, h("img", { src: "static/favicon.svg", width: 30, height: 30, alt: "" }), "PG-Backup", themeBtn()),
       h("nav", { class: "nav" }, PAGES.map(function (p) {
         return h("a", { href: "#/" + p[0], class: p[0] === active ? "on" : "", onclick: function () { side.classList.remove("open"); } }, icon(p[2]), t(p[1]));
       })),
       h("div", { class: "sp" }),
-      prefs(),
       h("div", { class: "sub ltr mono", style: "margin:0;padding:0 10px;font-size:11px" }, "v" + (state.me.version || "") + " · " + (state.me.build || "")),
       h("div", { class: "row", style: "padding:8px" }, h("span", { class: "pill" }, state.me.user),
         btn(t("c.logout"), function () { api("/logout", { method: "POST" }).then(function () { state.me = null; route(); }); }, "sm")));
     return h("div", { class: "shell" }, side, h("div", { class: "scrim", onclick: function () { side.classList.remove("open"); } }), h("div", null,
-      h("div", { class: "top" }, h("strong", null, "PG-Backup"), btn("☰", function () { side.classList.toggle("open"); }, "sm")),
+      h("div", { class: "top" }, h("strong", null, "PG-Backup"), h("div", { class: "tools" }, themeBtn(), btn("☰", function () { side.classList.toggle("open"); }, "sm"))),
       h("main", { class: "main" }, content)));
   }
   function page(title, sub, children) { return [h("h1", null, title), h("p", { class: "sub" }, sub || ""), children]; }
@@ -154,7 +175,7 @@
       });
     } }, field(t("login.user"), u), field(t("login.pass"), p), otpBox, err, h("button", { class: "btn pri", style: "width:100%;justify-content:center;margin-top:8px" }, t("login.submit")));
     return h("div", { class: "login" }, h("div", { class: "card" }, h("div", { class: "brand" }, h("img", { src: "static/favicon.svg", width: 34, height: 34, alt: "" }), "PG-Backup"),
-      h("p", { class: "sub", style: "text-align:center" }, t("login.sub")), f, h("div", { style: "margin-top:18px;display:flex;justify-content:center" }, prefs())));
+      h("p", { class: "sub", style: "text-align:center" }, t("login.sub")), f), themeBtn("floatpal"));
   }
 
   /* ---------- dashboard ---------- */

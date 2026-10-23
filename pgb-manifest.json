@@ -8,7 +8,7 @@
   "pgb/panel/app.py": "dbdd96a59ab4ceb50022827d324de12b94772eeb54b17324eeaeede3068e4501",
   "pgb/panel/jobs.py": "885d5c2da2f1dad267ad1a50a607beec2722bb6df32076df6223c749376bfeb4",
   "pgb/panel/security.py": "69879ca0a5177a60d6f19a549c558b1cf0e05185f8a3de841e9d2dcebdf0671c",
-  "pgb/panel/static/app.js": "a5bb10acc135905b3a4b920a142a7e843c25b9fd378fc5753e8482680bda826f",
+  "pgb/panel/static/app.js": "8cd0dbe812af8fec97613773480e058f8c1797eadb535f89b152306f2e54afa3",
   "pgb/panel/static/favicon.svg": "9865787ebe08cbddf53ae627e55345b209c502dc132dcb66a74ea92aec31e5e3",
   "pgb/panel/static/fonts/Inter-Bold.woff": "0feda2c8824701f2b0c04e9b8ece9a531ae107bc2e5c0ab10846b955b8cbdcc3",
   "pgb/panel/static/fonts/Inter-Medium.woff": "4d04ec086cc69774054f38dc7b69674290235fea3eac98d738e3f51f8493b23d",
@@ -20,7 +20,7 @@
   "pgb/panel/static/i18n.js": "8e57ed6f71353f7e1bb8b66da03b82b31eef089784e306ea1a7f3608f6ab3f48",
   "pgb/panel/static/index.html": "0e09eace341a8da841803030d7aaa02fc753892de93c56e70411c73a368de0cf",
   "pgb/panel/static/qr.js": "6756c7c3e4f6f8fb80e9993741b48d968035a8647c24309d64dd48da3a42ec35",
-  "pgb/panel/static/style.css": "7888f9d40c8fc13fea7fc383c319a903233bd000000a5dd6a7f845d4b0ddfc06",
+  "pgb/panel/static/style.css": "32b1dd86706413efabe236782a25c566cdb31697f62841c174ca3d24d0bc1f6a",
   "pgb/panel/store.py": "8d60d9a40ff8b339466917e8dc8d346290a02078af63b0b168abbc5ad0e4ad2c",
   "pgb/panel/tg.py": "9b4b6a2b68e6d6bdd7834a1ca9896c85b879d1874c75d0b7c7d8901c5041e17c"
  },
