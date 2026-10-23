@@ -231,7 +231,7 @@ def current_url() -> Optional[str]:
 def cmd_install(update: bool = False) -> None:
     need_root()
     if not os.path.isdir(os.path.join(ROOT, "pgb", "panel")):
-        die("panel files are missing; run this through PG-Backup menu option 7")
+        die("panel files are missing; run this through PG-Backup menu option 6")
     ensure_venv()
     os.makedirs(STATE, mode=0o700, exist_ok=True)
     first = not pgb("show-path").stdout.strip()

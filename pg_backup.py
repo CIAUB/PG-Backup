@@ -4,12 +4,12 @@
 #   Dev by: CIA 
 #   GitHub: https://github.com/CIAUB
 #   v5.0.0 — Web panel + database-engine conversion (CC BY-NC-ND):
-#          * NEW optional web panel (menu 7): HTTPS via Caddy, random secret
+#          * NEW optional web panel (menu 6): HTTPS via Caddy, random secret
 #            URL path, scrypt password + TOTP 2FA + rate limiting, backup
 #            manager, scheduler manager with live logs, Telegram settings,
 #            multi-server transfer, live job logs. Installed on demand; the
 #            frozen install.sh is untouched.
-#          * NEW database-engine conversion (menu 8 / --cli convert):
+#          * NEW database-engine conversion (menu 7 / --cli convert):
 #            TimescaleDB <-> PostgreSQL and MariaDB <-> MySQL. It reads a
 #            backup zip (or makes a fresh one from this server) and writes a
 #            NEW converted zip. It never restores anything and never changes
@@ -4092,7 +4092,7 @@ COMPONENT_DIR      = os.environ.get("PGB_ROOT", "/opt/pg-backup")
 # (vX.Y.Z), not from the moving `main` branch. Publish a tag for every release.
 # PGB_RAW_BASE overrides (tests, mirrors, a fork's main branch).
 COMPONENT_RAW_BASE = os.environ.get("PGB_RAW_BASE", "https://raw.githubusercontent.com/CIAUB/PG-Backup/v5.0.0")
-PGB_MANIFEST_SHA256 = "cdd6586f2a2fcc78abdb29f10afcbf446b6ea73c4baf0baebeb9a7de5243c521"
+PGB_MANIFEST_SHA256 = "edfe516970da7b1e0bfad72da5066cc0cd9cd1a5caae60d50a2c16151c0a3abb"
 PGB_VERSION = "5.0.0"
 
 def _fetch_bytes(url, timeout=40):
@@ -4123,7 +4123,7 @@ def _ensure_components(force=False):
         if not placeholder and got != PGB_MANIFEST_SHA256:
             print_error("Component manifest does not match the hash embedded in this script — refusing to install.")
             print_error(f"  expected {PGB_MANIFEST_SHA256}\n  got      {got}")
-            print_warning("Update PG-Backup (menu option 6) so the script and the components are the same release.")
+            print_warning("Update PG-Backup (menu option 8) so the script and the components are the same release.")
             return False
         manifest = json.loads(raw)
         files = manifest["files"]
@@ -4365,9 +4365,9 @@ MENU = [
     ("3", "Manual Backup (Save locally)"),
     ("4", "Manual Restore (From local zip)"),
     ("5", "Manage Backup Schedulers (start/stop/restart)"),
-    ("6", "Update to Latest Version"),
-    ("7", "Web Panel (install / manage)"),
-    ("8", "Convert Database Engine (TimescaleDB<->PostgreSQL, MariaDB<->MySQL)"),
+    ("6", "Web Panel (install / manage)"),
+    ("7", "Convert Database Engine (TimescaleDB<->PostgreSQL, MariaDB<->MySQL)"),
+    ("8", "Update to Latest Version"),
     ("9", "Exit"),
 ]
 
@@ -4403,13 +4403,13 @@ def main():
             workflow_manage_schedulers()
             pause_and_return()
         elif choice == "6":
-            workflow_update()
-            pause_and_return()
-        elif choice == "7":
             workflow_web_panel()
             pause_and_return()
-        elif choice == "8":
+        elif choice == "7":
             workflow_convert_db()
+            pause_and_return()
+        elif choice == "8":
+            workflow_update()
             pause_and_return()
         elif choice == "9":
             print(f"  {C.R2}Goodbye.{C.RESET}\n")

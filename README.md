@@ -128,9 +128,9 @@ PG-Backup
 3 ─ 💾 Manual Backup (Save Locally)
 4 ─ 🔄 Manual Restore (From Local ZIP)
 5 ─ 🧭 Manage Backup Schedulers
-6 ─ ⬆️ Update to Latest Version
-7 ─ 🌐 Web Panel (install / manage)
-8 ─ 🔀 Convert Database Engine
+6 ─ 🌐 Web Panel (install / manage)
+7 ─ 🔀 Convert Database Engine
+8 ─ ⬆️ Update to Latest Version
 9 ─ 🚪 Exit
 ```
 
@@ -185,7 +185,7 @@ Telegram Bot Token / Chat ID (اختیاری)
 
 # 🌐 پنل تحت وب
 
-از منوی اصلی گزینه‌ی **7 — Web Panel** را بزنید و «Install». نصب‌کننده خودش اجزای پنل را دانلود و **با manifest و SHA-256 راستی‌آزمایی** می‌کند (فایل `install.sh` دست‌نخورده می‌ماند)، یک virtualenv می‌سازد، سرویس systemd و Caddy را راه می‌اندازد.
+از منوی اصلی گزینه‌ی **6 — Web Panel** را بزنید و «Install». نصب‌کننده خودش اجزای پنل را دانلود و **با manifest و SHA-256 راستی‌آزمایی** می‌کند (فایل `install.sh` دست‌نخورده می‌ماند)، یک virtualenv می‌سازد، سرویس systemd و Caddy را راه می‌اندازد.
 
 | قابلیت | توضیح |
 |---|---|
@@ -206,7 +206,7 @@ Telegram Bot Token / Chat ID (اختیاری)
 
 # 🔀 تبدیل نوع دیتابیس
 
-از منوی **8 — Convert Database Engine** یا از پنل وب (صفحه‌ی «تبدیل دیتابیس»). این ابزار از **یک فایل بکاپ PG-Backup** یک **فایل بکاپ جدید** با نوع دیگری از دیتابیس می‌سازد:
+از منوی **7 — Convert Database Engine** یا از پنل وب (صفحه‌ی «تبدیل دیتابیس»). این ابزار از **یک فایل بکاپ PG-Backup** یک **فایل بکاپ جدید** با نوع دیگری از دیتابیس می‌سازد:
 
 | از | به |
 |---|---|
@@ -286,7 +286,7 @@ backup_full_YYYYMMDDHHMMSS.zip
 
 # ⬆️ آپدیت به آخرین نسخه
 
-از منوی اصلی (گزینه ۶):
+از منوی اصلی (گزینه ۸):
 
 ```text
 Download install.sh + install.sh.sha256   →   tmp dir خصوصی (0700)
